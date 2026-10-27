@@ -1,0 +1,18 @@
+# Binarios y objetos
+compiler
+*.o
+*.out
+a.out
+
+# Salidas de pruebas
+outputs/
+inputs/*_tokens.txt
+inputs/*_ast.txt
+
+# Material de referencia
+reference_sem11/
+Sem11_Code2(1).zip
+Proyecto2_Enunciado.pdf
+
+# Sistema
+.DS_Store

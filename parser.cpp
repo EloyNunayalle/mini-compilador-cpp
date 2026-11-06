@@ -73,12 +73,25 @@ bool Parser::isBaseTypeStart() const {
         case Token::KW_BOOL:
         case Token::KW_CHAR:
         case Token::KW_VOID:
+        case Token::LIB_STRING:
             return true;
         case Token::ID:
-            return knownTypes.find(current->text) != knownTypes.end();
+            if (knownTypes.find(current->text) != knownTypes.end()) return true;
+            return current->text == "std" && peekIsStdString();
         default:
             return false;
     }
+}
+
+// Mira dos tokens adelante sobre una copia del scanner: std :: string
+bool Parser::peekIsStdString() const {
+    Scanner lookahead(*scanner);
+    Token* t1 = lookahead.nextToken();
+    Token* t2 = lookahead.nextToken();
+    bool res = t1 && t2 && t1->type == Token::COLON_COLON && t2->type == Token::LIB_STRING;
+    delete t1;
+    delete t2;
+    return res;
 }
 
 // =========================================================================
@@ -168,6 +181,10 @@ vector<string> Parser::parseQualifiedId() {
     parts.push_back(first->text);
 
     while (match(Token::COLON_COLON)) {
+        if (match(Token::LIB_STRING)) {
+            parts.push_back("string");
+            continue;
+        }
         Token* next = consume(Token::ID, "Se esperaba identificador después de '::'");
         parts.push_back(next->text);
     }
@@ -185,9 +202,15 @@ Type Parser::parseBaseType() {
     if (match(Token::KW_BOOL))   return Type(Type::BOOL);
     if (match(Token::KW_CHAR))   return Type(Type::CHAR);
     if (match(Token::KW_VOID))   return Type(Type::VOID);
+    if (match(Token::LIB_STRING)) return Type(Type::STRING);
 
     if (check(Token::ID)) {
         vector<string> qid = parseQualifiedId();
+        if (qid.size() == 2 && qid[0] == "std" && qid[1] == "string") {
+            Type t(Type::STRING);
+            t.recordName = "std::string"; // el TypeChecker normaliza esta marca
+            return t;
+        }
         string fullName = "";
         for (size_t i = 0; i < qid.size(); i++) {
             if (i > 0) fullName += "::";

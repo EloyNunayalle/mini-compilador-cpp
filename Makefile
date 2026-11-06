@@ -1,11 +1,11 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2
 
-SRCS = token.cpp scanner.cpp type.cpp ast.cpp parser.cpp print_visitor.cpp type_checker.cpp main.cpp
+SRCS = token.cpp scanner.cpp type.cpp ast.cpp parser.cpp print_visitor.cpp type_checker.cpp gencode.cpp main.cpp
 OBJS = $(SRCS:.cpp=.o)
 TARGET = compiler
 
-.PHONY: all clean test
+.PHONY: all clean test test-gencode
 
 all: $(TARGET)
 
@@ -22,3 +22,6 @@ clean:
 
 test: $(TARGET)
 	python3 run_tests.py
+
+test-gencode: $(TARGET)
+	python3 run_gencode_tests.py

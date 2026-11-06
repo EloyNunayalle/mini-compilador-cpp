@@ -28,7 +28,7 @@ private:
     void error(const string& msg);
 
     bool isBaseTypeStart() const;
-    bool isDeclarationStart();
+    bool peekIsStdString() const;
 
 public:
     Parser(Scanner* scanner);

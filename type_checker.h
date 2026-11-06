@@ -4,25 +4,28 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include "visitor.h"
 #include "ast.h"
 #include "type.h"
+#include "layout.h"
 #include "environment.h"
 
 using namespace std;
 
-// Visitor de análisis semántico y comprobación de tipos
-// Diseñado siguiendo el patrón TypeChecker de la Semana 11 del curso
+// Analisis semantico, comprobacion de tipos y layout.
+// Deja anotado el AST (tipos, offsets, simbolos resueltos) para el Gencode.
 class TypeChecker : public Visitor {
 public:
-    Environment<Type> env;                       // Tabla de símbolos con scopes jerárquicos
-    unordered_map<string, FunDecl*> functions;  // Firmas de funciones
-    unordered_map<string, RecordDecl*> records;  // Tipos struct / class registrados
-    FunDecl* currentFunction;                   // Función actualmente en verificación
-    int loopDepth;                              // Profundidad de bucles (para break/continue)
+    Environment<VarInfo> env;                    // tabla de simbolos con scopes jerarquicos
+    unordered_map<string, FunDecl*> functions;   // funciones libres
+    unordered_map<string, RecordDecl*> records;  // structs y classes, con su RecordLayout
+    FunDecl* currentFunction;
+    RecordDecl* currentRecord;                   // record cuyo metodo se esta verificando
+    int loopDepth;
 
-    vector<string> errors;                      // Lista de errores semánticos detectados
-    vector<string> warnings;                    // Lista de advertencias semánticas
+    vector<string> errors;
+    vector<string> warnings;
 
     TypeChecker();
 
@@ -70,6 +73,49 @@ public:
     void visit(IncludeDirective* inc) override;
     void visit(UsingDirective* usg) override;
     void visit(Program* prog) override;
+
+private:
+    bool hasIostream;
+    bool hasString;
+    bool hasCmath;
+    bool usingNamespaceStd;
+    unordered_set<string> usingNames;
+
+    int frameUsed;                 // bytes de locales asignados en la funcion actual
+    vector<int> curStringSlots;
+    size_t paramIndex;
+
+    Type annotate(Exp* e, const Type& t, bool lvalue = false);
+
+    // tamanos y layout
+    int sizeOf(const Type& t);
+    int alignOf(const Type& t);
+    bool hasStrings(const Type& t);
+    void collectStringOffsets(const Type& t, vector<int>& out);
+    int pointeeSize(const Type& ptr, int line, int col);
+
+    // tipos
+    Type resolveType(Type t, int line, int col);
+    Type declaredType(const Type& base, int ptrs, bool ref, const vector<Exp*>& dims, int line, int col);
+    Type decay(const Type& t) const;
+    bool stdNameVisible(const IdExp* id, const string& name) const;
+    bool assignable(const Type& to, Exp* from);
+    bool boolConvertible(const Type& t) const;
+    bool isNullLiteral(const Exp* e) const;
+    bool constEval(Exp* e, long long& out);
+    bool printable(const Type& t) const;
+
+    // declaraciones
+    void declareRecord(RecordDecl* rd);
+    void declareFunction(FunDecl* fd, RecordDecl* owner);
+    VarInfo allocLocal(const Type& t);
+    VarInfo makeVarInfo(const Type& t, bool global, const string& name);
+    void checkInitializer(const Type& target, Exp* init, int line, int col);
+    void checkCondition(Exp* cond, int line, int col);
+    Type checkCall(PostfixExp* call);
+    Type checkMemberAccess(PostfixExp* exp);
+    void checkArgs(PostfixExp* call, FunDecl* fd, const string& name);
+    Type callResult(PostfixExp* call, FunDecl* fd);
 };
 
 #endif // TYPE_CHECKER_H

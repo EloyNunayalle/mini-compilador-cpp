@@ -7,6 +7,7 @@
 #include "ast.h"
 #include "print_visitor.h"
 #include "type_checker.h"
+#include "gencode.h"
 
 using namespace std;
 
@@ -27,6 +28,7 @@ void mostrarAyuda(const char* prog) {
     cout << "  --ast     : Muestra el Árbol de Sintaxis Abstracta (AST) formateado.\n";
     cout << "  --check   : Ejecuta el análisis semántico y comprobación de tipos.\n";
     cout << "  --all     : Ejecuta todas las fases del Frontend y genera reportes.\n";
+    cout << "  --asm [salida.s] : Genera ensamblador GNU AS (AT&T, Linux x86-64). Por defecto <archivo>.s\n";
     cout << "  (por defecto: ejecuta parseo y verificación semántica completa)\n";
 }
 
@@ -38,6 +40,7 @@ int main(int argc, const char* argv[]) {
 
     string archivoEntrada = argv[1];
     string opcion = (argc >= 3) ? argv[2] : "--default";
+    string archivoSalida = (argc >= 4) ? argv[3] : "";
 
     if (archivoEntrada == "-h" || archivoEntrada == "--help") {
         mostrarAyuda(argv[0]);
@@ -111,6 +114,27 @@ int main(int argc, const char* argv[]) {
     }
 
     cout << "\n[ÉXITO] El programa es sintáctica y semánticamente correcto según la gramática EBNF.\n";
+
+    // 4. Generación de código (ensamblador x86-64 AT&T)
+    if (opcion == "--asm") {
+        string asmFile = archivoSalida.empty() ? sinExtension(archivoEntrada) + ".s" : archivoSalida;
+        ofstream outAsm(asmFile);
+        if (!outAsm.is_open()) {
+            cerr << "Error: no se pudo escribir " << asmFile << endl;
+            delete ast;
+            return 1;
+        }
+        try {
+            Gencode gen(checker.records);
+            gen.generate(ast, outAsm);
+        } catch (const exception& e) {
+            cerr << "\n[FALLO GENCODE] " << e.what() << endl;
+            delete ast;
+            return 1;
+        }
+        outAsm.close();
+        cout << "Ensamblador generado en " << asmFile << "\n";
+    }
 
     // Si es --all, guardar el AST en archivo de texto
     if (opcion == "--all") {

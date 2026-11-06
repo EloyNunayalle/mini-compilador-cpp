@@ -48,36 +48,46 @@ Type Type::makeError() {
     return Type(ERROR);
 }
 
-bool Type::isVoid() const      { return kind == VOID && ptrLevel == 0; }
-bool Type::isInt() const       { return kind == INT && ptrLevel == 0; }
-bool Type::isFloat() const     { return kind == FLOAT && ptrLevel == 0; }
-bool Type::isDouble() const    { return kind == DOUBLE && ptrLevel == 0; }
-bool Type::isBool() const      { return kind == BOOL && ptrLevel == 0; }
-bool Type::isChar() const      { return kind == CHAR && ptrLevel == 0; }
-bool Type::isString() const    { return kind == STRING && ptrLevel == 0; }
-bool Type::isRecord() const    { return kind == RECORD && ptrLevel == 0; }
-bool Type::isPointer() const   { return ptrLevel > 0; }
+bool Type::isVoid() const      { return kind == VOID && ptrLevel == 0 && arrayDims.empty(); }
+bool Type::isInt() const       { return kind == INT && ptrLevel == 0 && arrayDims.empty(); }
+bool Type::isFloat() const     { return kind == FLOAT && ptrLevel == 0 && arrayDims.empty(); }
+bool Type::isDouble() const    { return kind == DOUBLE && ptrLevel == 0 && arrayDims.empty(); }
+bool Type::isBool() const      { return kind == BOOL && ptrLevel == 0 && arrayDims.empty(); }
+bool Type::isChar() const      { return kind == CHAR && ptrLevel == 0 && arrayDims.empty(); }
+bool Type::isString() const    { return kind == STRING && ptrLevel == 0 && arrayDims.empty(); }
+bool Type::isRecord() const    { return kind == RECORD && ptrLevel == 0 && arrayDims.empty(); }
+bool Type::isPointer() const   { return ptrLevel > 0 && arrayDims.empty(); }
 bool Type::isReference() const { return isRef; }
 bool Type::isError() const     { return kind == ERROR; }
+bool Type::isArray() const     { return !arrayDims.empty(); }
+bool Type::isStream() const    { return (kind == OSTREAM || kind == ISTREAM) && ptrLevel == 0; }
 
 bool Type::isNumeric() const {
-    if (ptrLevel > 0) return false;
+    if (ptrLevel > 0 || !arrayDims.empty()) return false;
     return kind == INT || kind == FLOAT || kind == DOUBLE || kind == CHAR || kind == BOOL;
 }
 
-bool Type::isCompatibleWith(const Type& other) const {
-    if (isError() || other.isError()) return false;
-    if (*this == other) return true;
+bool Type::isIntegral() const {
+    return isInt() || isChar() || isBool();
+}
 
-    // Conversiones numéricas implícitas permitidas en C++
-    if (isNumeric() && other.isNumeric()) return true;
+Type Type::elementType() const {
+    Type t = *this;
+    t.isRef = false;
+    if (!t.arrayDims.empty()) t.arrayDims.erase(t.arrayDims.begin());
+    return t;
+}
 
-    // Asignación de nullptr a cualquier puntero
-    if (isPointer() && other.kind == INT && other.intValue == 0 && other.isConstExpr) return true;
-    if (isPointer() && other.isPointer() && other.kind == VOID) return true; // void* en C++ permisivo
-    if (kind == VOID && ptrLevel > 0 && other.isPointer()) return true;
+Type Type::withoutRef() const {
+    Type t = *this;
+    t.isRef = false;
+    return t;
+}
 
-    return false;
+bool Type::sameBase(const Type& other) const {
+    if (kind != other.kind || ptrLevel != other.ptrLevel) return false;
+    if (kind == RECORD && recordName != other.recordName) return false;
+    return true;
 }
 
 bool Type::operator==(const Type& other) const {
@@ -103,6 +113,9 @@ string Type::toString() const {
         case CHAR:   res = "char"; break;
         case STRING: res = "string"; break;
         case RECORD: res = recordName.empty() ? "record" : recordName; break;
+        case OSTREAM: res = "ostream"; break;
+        case ISTREAM: res = "istream"; break;
+        case ENDL:   res = "endl"; break;
         case ERROR:  res = "<error-type>"; break;
     }
     for (int i = 0; i < ptrLevel; i++) res += "*";

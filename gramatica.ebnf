@@ -37,6 +37,7 @@ NonVoidBaseType ::= int
                   | double
                   | bool
                   | char
+                  | string
                   | QualifiedId
 
 BaseType ::= NonVoidBaseType
@@ -47,6 +48,8 @@ ReturnType ::= NonVoidBaseType { "*" } [ "&" ]
 
 VoidPointerSuffix ::= "*" { "*" } [ "&" ]
 ```
+
+`string` requiere `#include <string>`; `std::string` se escribe como `QualifiedId`.
 
 ---
 

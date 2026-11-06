@@ -19,6 +19,9 @@ public:
         CHAR,
         STRING,
         RECORD,
+        OSTREAM,    // resultado de cout << x (solo para encadenar)
+        ISTREAM,    // resultado de cin >> x
+        ENDL,       // manipulador endl
         ERROR
     };
 
@@ -58,8 +61,14 @@ public:
     bool isReference() const;
     bool isNumeric() const;
     bool isError() const;
+    bool isArray() const;
+    bool isIntegral() const;   // int, char o bool sin puntero ni arreglo
+    bool isStream() const;
 
-    bool isCompatibleWith(const Type& other) const;
+    Type elementType() const;  // quita la dimension mas externa del arreglo
+    Type withoutRef() const;
+    bool sameBase(const Type& other) const; // mismo tipo base y nivel de puntero, ignora ref y dimensiones
+
     bool operator==(const Type& other) const;
     bool operator!=(const Type& other) const;
 

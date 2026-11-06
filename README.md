@@ -18,6 +18,9 @@ El código está estructurado de manera modular y desacoplada:
 | **Visitor Base** | `visitor.h` | Interfaz abstracta para recorrer nodos del AST separando la estructura de los algoritmos. |
 | **Visualizador** | `print_visitor.h`, `print_visitor.cpp` | Visitor que recorre el AST e imprime una representación jerárquica en consola con caracteres de árbol (`├── `, `└── `). |
 | **Semántico** | `type_checker.h`, `type_checker.cpp` | Visitor que realiza la comprobación de tipos, valida signaturas de funciones y detecta identificadores no declarados o redeclarados. |
+| **Layout** | `layout.h` | Estructuras `VarInfo`, `RecordLayout`, `FunctionLayout` con offsets, tamaños y alineaciones calculados por el TypeChecker. |
+| **Gencode** | `gencode.h`, `gencode.cpp` | Visitor que emite ensamblador GNU AS (AT&T) para Linux x86-64, ABI System V, sin optimizaciones. Solo lee las anotaciones del AST. |
+| **Runtime** | `runtime/runtime.c` | `string` dinámico, `cout` y `cin` en C puro (sin libstdc++). |
 | **Driver CLI** | `main.cpp` | Punto de entrada del compilador que coordina las fases según los argumentos de línea de comandos. |
 
 ---
@@ -53,6 +56,7 @@ make clean
 - `--ast`: Muestra el Árbol de Sintaxis Abstracta (AST) formateado en la terminal.
 - `--check`: Ejecuta el análisis semántico y comprobación de tipos detallada.
 - `--all`: Ejecuta todas las fases, muestra el AST y exporta los archivos `<archivo>_tokens.txt` y `<archivo>_ast.txt`.
+- `--asm [salida.s]`: Además del análisis, genera ensamblador x86-64 AT&T (por defecto `<archivo>.s`).
 
 ---
 
@@ -213,11 +217,10 @@ El compilador reporta errores sintácticos y semánticos con ubicación exacta (
 ```text
 === [FASE 3: ANÁLISIS SEMÁNTICO Y COMPROBACIÓN DE TIPOS] ===
 
---- ERRORES SEMÁNTICOS (2) ---
+--- ERRORES SEMÁNTICOS (1) ---
   Error Semántico [Línea 3, Columna 17] Identificador no declarado: 'variableInexistente'
-  Error Semántico [Línea 3, Columna 9] Inicialización incompatible para variable 'b': tipo 'int' inicializado con '<error-type>'
 
-[FALLO SEMÁNTICO] Se encontraron 2 error(es) semántico(s).
+[FALLO SEMÁNTICO] Se encontraron 1 error(es) semántico(s).
 ```
 
 #### Caso B: Incompatibilidad de tipos en asignación y retorno
@@ -230,7 +233,7 @@ El compilador reporta errores sintácticos y semánticos con ubicación exacta (
 
 --- ERRORES SEMÁNTICOS (2) ---
   Error Semántico [Línea 3, Columna 5] Tipo de retorno incompatible en 'suma': se esperaba 'int', pero se devolvió 'int*'
-  Error Semántico [Línea 7, Columna 10] Inicialización incompatible para variable 'ptr': tipo 'int*' inicializado con 'int'
+  Error Semántico [Línea 7, Columna 10] Inicialización incompatible: tipo 'int*' inicializado con 'int'
 
 [FALLO SEMÁNTICO] Se encontraron 2 error(es) semántico(s).
 ```
@@ -292,3 +295,46 @@ Tokens y ASTs generados en carpeta 'outputs/'
 - [`07_sem_error_undeclared.cpp`](inputs/07_sem_error_undeclared.cpp): Caso de error: uso de variable no declarada.
 - [`08_sem_error_types.cpp`](inputs/08_sem_error_types.cpp): Caso de error: asignación de entero a puntero y discrepancia en tipo de retorno.
 - [`09_sem_error_break.cpp`](inputs/09_sem_error_break.cpp): Caso de error: `break` fuera del ámbito de un bucle.
+
+
+---
+
+## 6. Generación de Código (Linux x86-64, System V)
+
+```bash
+./compiler programa.cpp --asm programa.s
+gcc programa.s runtime/runtime.c -o programa
+./programa
+```
+
+### Decisiones de diseño
+
+- **Sin optimizaciones**: cada operación del fuente emite su instrucción, aunque los operandos sean literales. El TypeChecker evalúa constantes solo para dimensiones de arreglos.
+- **Resultados**: `int/char/bool` en `%eax`, punteros y direcciones en `%rax`, `float/double` en `%xmm0`. Temporales con `push/pop` y alineación de `%rsp` a 16 antes de cada `call`.
+- **Frame**: `pushq %rbp; movq %rsp,%rbp; subq $N,%rsp` con `N` múltiplo de 16. Cada variable tiene un offset único (sin reutilizar slots). El callee guarda todos los parámetros en pila.
+- **Llamadas**: enteros en `%rdi,%rsi,%rdx,%rcx,%r8,%r9`, flotantes en `%xmm0-7`, el resto en pila. Los métodos reciben `this` como primer argumento.
+- **Layout**: modelo LP64 (`char/bool` 1, `int/float` 4, `double`/puntero/referencia 8), padding por alineación natural, `string` de 16 bytes.
+- **Globales**: en `.bss`; sus inicializadores corren en orden de declaración dentro de `__init_globals`, invocada al inicio de `main`.
+- **Etiquetas**: funciones `f_nombre`, métodos `m_Record_nombre`, globales `g_nombre`, para no chocar con libc.
+- **Strings**: se reinician al declararse y se liberan al salir de la función (el compilador inserta la limpieza; no hay destructores de usuario).
+- **Includes y `using`**: `cout`, `cin`, `endl` requieren `<iostream>` y `using namespace std` o `std::`; `string` requiere `<string>`; `sqrt` requiere `<cmath>`.
+
+### Limitaciones conocidas
+
+- No hay paso ni retorno de records o `string` por valor (usar `&` o `*`).
+- Sin arreglos de `string`, ni `new` de records con `string`; sin inicialización con llaves de records con `string`.
+- `new T[n]` solo con una dimensión; parámetros de arreglo solo de una dimensión.
+- Métodos de `string`: `size`, `length`, `empty`, `clear`, `c_str`, `append`, `push_back`, `[]`, `==`, `!=`. No hay `+` entre strings.
+- Funciones solo pueden llamarse si están declaradas en el archivo (el parser no admite prototipos sin cuerpo).
+- Sin constructores, destructores, herencia, templates, excepciones ni sobrecarga.
+- Negación de `float/double` voltea el bit de signo; sin comprobación de límites en arreglos.
+
+### Pruebas de Gencode
+
+```bash
+python3 run_gencode_tests.py            # ensambla, ejecuta y compara con tests_gencode/*.expected
+python3 run_gencode_tests.py --asan     # con AddressSanitizer y LeakSanitizer
+python3 run_gencode_tests.py --update-expected   # regenera esperados con g++ real
+```
+
+En Linux x86-64 usa `gcc` local; en otras plataformas usa Docker (`gcc` para `linux/amd64`). Los `.expected` provienen de `g++`, por lo que validan contra el comportamiento real de C++.

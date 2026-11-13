@@ -19,6 +19,8 @@ El código está estructurado de manera modular y desacoplada:
 | **Visualizador** | `print_visitor.h`, `print_visitor.cpp` | Visitor que recorre el AST e imprime una representación jerárquica en consola con caracteres de árbol (`├── `, `└── `). |
 | **Semántico** | `type_checker.h`, `type_checker.cpp` | Visitor que realiza la comprobación de tipos, valida signaturas de funciones y detecta identificadores no declarados o redeclarados. |
 | **Layout** | `layout.h` | Estructuras `VarInfo`, `RecordLayout`, `FunctionLayout` con offsets, tamaños y alineaciones calculados por el TypeChecker. |
+| **Optimizador** | `optimizer.h`, `optimizer.cpp` | Pases opcionales sobre el AST (`FoldVisitor`, `InlineVisitor`, `SethiVisitor`) y análisis de pureza. Solo con `-O1`. |
+| **API JSON** | `api.h`, `api.cpp` | Modo `--api`: tokens, AST (con y sin tipos), layout/ABI, ensamblador y estadísticas de optimización en un objeto JSON. |
 | **Gencode** | `gencode.h`, `gencode.cpp` | Visitor que emite ensamblador GNU AS (AT&T) para Linux x86-64, ABI System V, sin optimizaciones. Solo lee las anotaciones del AST. |
 | **Runtime** | `runtime/runtime.c` | `string` dinámico, `cout` y `cin` en C puro (sin libstdc++). |
 | **Driver CLI** | `main.cpp` | Punto de entrada del compilador que coordina las fases según los argumentos de línea de comandos. |
@@ -56,6 +58,8 @@ make clean
 - `--ast`: Muestra el Árbol de Sintaxis Abstracta (AST) formateado en la terminal.
 - `--check`: Ejecuta el análisis semántico y comprobación de tipos detallada.
 - `--all`: Ejecuta todas las fases, muestra el AST y exporta los archivos `<archivo>_tokens.txt` y `<archivo>_ast.txt`.
+- `-O0` (por defecto) / `-O1`: con `-O1` corren los pases de optimización antes del Gencode. `--passes inline,fold,sethi` elige pases y `--report-opt` lista las transformaciones.
+- `--api --mode <scan|ast|check|asm|all>`: lee el código por stdin y responde JSON (lo usa el editor web).
 - `--asm [salida.s]`: Además del análisis, genera ensamblador x86-64 AT&T (por defecto `<archivo>.s`).
 
 ---
@@ -309,32 +313,81 @@ gcc programa.s runtime/runtime.c -o programa
 
 ### Decisiones de diseño
 
-- **Sin optimizaciones**: cada operación del fuente emite su instrucción, aunque los operandos sean literales. El TypeChecker evalúa constantes solo para dimensiones de arreglos.
-- **Resultados**: `int/char/bool` en `%eax`, punteros y direcciones en `%rax`, `float/double` en `%xmm0`. Temporales con `push/pop` y alineación de `%rsp` a 16 antes de cada `call`.
-- **Frame**: `pushq %rbp; movq %rsp,%rbp; subq $N,%rsp` con `N` múltiplo de 16. Cada variable tiene un offset único (sin reutilizar slots). El callee guarda todos los parámetros en pila.
-- **Llamadas**: enteros en `%rdi,%rsi,%rdx,%rcx,%r8,%r9`, flotantes en `%xmm0-7`, el resto en pila. Los métodos reciben `this` como primer argumento.
+- **El Gencode no optimiza**: cada operación del fuente emite su instrucción, y cada copia, constructor y destructor que exige la semántica se emite también. Sin movimiento ni elisión de copias (ver más abajo).
+- **Resultados**: `int/char/bool` en `%eax`, punteros y direcciones en `%rax`, `float/double` en `%xmm0`. Un record o `string` devuelto por valor vive en un temporal del marco y la expresión produce su dirección. Temporales con `push/pop` y alineación de `%rsp` a 16 antes de cada `call`.
+- **Frame**: `pushq %rbp; movq %rsp,%rbp; subq $N,%rsp` con `N` múltiplo de 16. Cada variable y cada temporal tienen un offset único (sin reutilizar slots).
 - **Layout**: modelo LP64 (`char/bool` 1, `int/float` 4, `double`/puntero/referencia 8), padding por alineación natural, `string` de 16 bytes.
-- **Globales**: en `.bss`; sus inicializadores corren en orden de declaración dentro de `__init_globals`, invocada al inicio de `main`.
-- **Etiquetas**: funciones `f_nombre`, métodos `m_Record_nombre`, globales `g_nombre`, para no chocar con libc.
-- **Strings**: se reinician al declararse y se liberan al salir de la función (el compilador inserta la limpieza; no hay destructores de usuario).
+- **Globales**: en `.bss`; se construyen en orden de declaración dentro de `__init_globals` (llamada al inicio de `main`) y se destruyen en orden inverso en `__fini_globals` al terminar `main`.
+- **Etiquetas**: funciones `f_nombre`, métodos `m_Record_nombre`, constructores `ctor_Record_default|args|copy`, destructor `dtor_Record`, asignación `assign_Record`, globales `g_nombre`.
 - **Includes y `using`**: `cout`, `cin`, `endl` requieren `<iostream>` y `using namespace std` o `std::`; `string` requiere `<string>`; `sqrt` requiere `<cmath>`.
+
+### Clases: constructores, copia, destructor y asignación
+
+- Constructor por defecto, un constructor con parámetros y constructor de copia (`T(const T&)` o `T(T&)`). Si se declara cualquier constructor desaparece el constructor por defecto implícito.
+- Lista de inicialización (`T(int a) : x(a), s("hola") {}`); los campos se inicializan en orden de declaración, no en el de la lista. Precedencia: lista, inicializador en la clase, inicialización por defecto.
+- Inicializadores de campo en la clase (`int x = 1;`), limitados a expresiones constantes.
+- Destructor `~T()`; los campos se destruyen en orden inverso después del cuerpo. Los destructores corren al salir de bloques, en `return`, `break` y `continue`, con `delete`/`delete[]`, al final de temporales y de parámetros por valor, y al terminar el programa para los globales.
+- Asignación de copia solo como `T& operator=(const T&)`. Si no se declara se genera una miembro a miembro; los `string` se copian en profundidad. Es la única sobrecarga de operador permitida.
+- Creación: `T t;`, `T t(args);`, `T t = otro;`, `T t = {a, b}` (agregados), `T(args)` como temporal, `new T`, `new T(args)`, `new T[n]` (con `delete[]`).
+- Reglas de generación implícita de C++ (constructor por defecto suprimido, copia y asignación eliminadas con campos `const` o referencias).
+
+### const
+
+Variables, parámetros, campos, punteros a const (`const T*`), punteros const (`T* const`), referencias a const, métodos const, objetos y arreglos const y `string` const. El TypeChecker rechaza escrituras y conversiones que quitan `const`; `const int N = 4;` sirve como dimensión de arreglo.
+
+### Paso y retorno de records (System V AMD64 / Itanium)
+
+El TypeChecker calcula la clasificación (`INTEGER`, `SSE`, `MEMORY`) por eightbyte, el reparto en registros enteros y XMM, los argumentos en pila y el retorno; el Gencode solo la consume.
+
+- Record trivial de hasta 16 bytes: en registros según la clase de cada eightbyte. Si faltan registros o supera 16 bytes: en pila.
+- Record con constructor de copia o destructor no trivial (incluye los que contienen `string`): se pasa por referencia invisible y se devuelve por puntero oculto en `%rdi`. Orden: puntero de retorno, `this`, argumentos.
+- Diferencia con la ABI de Itanium: el llamador crea la copia del argumento y la destruye al final de la expresión completa (igual que Itanium).
+
+### Diferencias con C++17
+
+- No hay constructor ni asignación de movimiento, `std::move`, referencias rvalue ni elisión de copias (ni obligatoria ni opcional): `T t = f();` hace las dos copias de C++14 sin elisión. Los resultados esperados de las pruebas salen de `g++ -std=c++14 -fno-elide-constructors`.
+- Sin conversiones implícitas por constructor (`T t = 5;` se rechaza; usar `T t(5);`).
+- Un temporal enlazado a una referencia const de una variable vive hasta el final de su scope.
+- Un literal de cadena se acepta como `char*` (extensión de GCC) además de `const char*`.
 
 ### Limitaciones conocidas
 
-- No hay paso ni retorno de records o `string` por valor (usar `&` o `*`).
-- Sin arreglos de `string`, ni `new` de records con `string`; sin inicialización con llaves de records con `string`.
+- Sin herencia, funciones virtuales, templates, excepciones, `static`, `friend`, `explicit`, `mutable`, `volatile`, `constexpr`, sobrecarga general ni argumentos por defecto.
 - `new T[n]` solo con una dimensión; parámetros de arreglo solo de una dimensión.
 - Métodos de `string`: `size`, `length`, `empty`, `clear`, `c_str`, `append`, `push_back`, `[]`, `==`, `!=`. No hay `+` entre strings.
-- Funciones solo pueden llamarse si están declaradas en el archivo (el parser no admite prototipos sin cuerpo).
-- Sin constructores, destructores, herencia, templates, excepciones ni sobrecarga.
-- Negación de `float/double` voltea el bit de signo; sin comprobación de límites en arreglos.
+- Las funciones deben estar definidas en el archivo antes de usarse como firma; el parser no admite prototipos sin cuerpo.
+- Sin comprobación de límites en arreglos.
 
-### Pruebas de Gencode
+## 7. Optimizaciones (`-O1`)
+
+`-O0` es el modo por defecto y no ejecuta ningún pase. Con `-O1` corren, en este orden, tres visitors separados sobre el AST; después de cada uno se vuelve a ejecutar el TypeChecker, de modo que el Gencode recibe tipos, offsets y ABI actuales. Si esa verificación falla, la optimización se descarta y se compila sin optimizar.
+
+- **Inline**: solo funciones libres de una sola sentencia `return expr;`, escalares, sin llamadas, sin variables globales, sin `&&`/`||` y con argumentos puros del mismo tipo. Clona el AST. Rechaza recursión, argumentos con efectos, objetos y strings.
+- **Fold**: plegado de constantes enteras (sin overflow ni división por cero), identidades (`x+0`, `x*1`, `x/1`), `x*0` solo si `x` es puro, `x*2` a `x+x` solo si `x` es puro, y cortocircuito solo si el lado eliminado es puro. No toca floats, strings, records ni expresiones con efectos.
+- **Sethi**: en expresiones enteras puras intercambia los operandos de operadores conmutativos para evaluar primero el subárbol más pesado (menor profundidad de pila). No toca `&&`/`||`.
+
+No se optimizan constructores, destructores, copias, asignaciones, `new`, `delete` ni inicializadores globales.
 
 ```bash
+python3 run_opt_tests.py    # compara -O0 y -O1 (salida y código de retorno) y el oráculo
+```
+
+## 8. API y editor web (Docker)
+
+```bash
+docker compose up --build        # luego abrir http://127.0.0.1:8080
+```
+
+Un solo contenedor `linux/amd64` compila el compilador, sirve el API (`/api/compile`, `/api/health`, `/api/status`, `/api/examples`) y el editor. El editor muestra tokens, AST con y sin tipos, layout y ABI, ensamblador, salida, diagnóstico por fase y el efecto de `-O1`. El código se compila con `gcc` junto a `runtime/runtime.c` dentro del contenedor, con tiempo y recursos limitados. Pruebas: `python3 tests_api/test_api.py`, `node tests_api/test_frontend_lib.js` y `tests_api/run_docker_tests.sh`.
+
+### Pruebas del compilador
+
+```bash
+python3 run_tests.py                    # frontend
 python3 run_gencode_tests.py            # ensambla, ejecuta y compara con tests_gencode/*.expected
 python3 run_gencode_tests.py --asan     # con AddressSanitizer y LeakSanitizer
 python3 run_gencode_tests.py --update-expected   # regenera esperados con g++ real
+python3 run_opt_tests.py                # -O0 contra -O1
 ```
 
-En Linux x86-64 usa `gcc` local; en otras plataformas usa Docker (`gcc` para `linux/amd64`). Los `.expected` provienen de `g++`, por lo que validan contra el comportamiento real de C++.
+En Linux x86-64 usan `gcc` local; en otras plataformas usan Docker (`gcc` para `linux/amd64`).

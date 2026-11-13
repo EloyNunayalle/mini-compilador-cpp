@@ -1,7 +1,7 @@
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -Wextra -O2
+CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -MMD -MP
 
-SRCS = token.cpp scanner.cpp type.cpp ast.cpp parser.cpp print_visitor.cpp type_checker.cpp gencode.cpp main.cpp
+SRCS = token.cpp scanner.cpp type.cpp ast.cpp ast_clone.cpp parser.cpp print_visitor.cpp type_checker.cpp gencode.cpp optimizer.cpp api.cpp main.cpp
 OBJS = $(SRCS:.cpp=.o)
 TARGET = compiler
 
@@ -17,7 +17,7 @@ $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJS) $(TARGET) inputs/*_tokens.txt inputs/*_ast.txt
+	rm -f $(OBJS) $(OBJS:.o=.d) $(TARGET) inputs/*_tokens.txt inputs/*_ast.txt
 	@echo "Limpieza completada."
 
 test: $(TARGET)
@@ -25,3 +25,5 @@ test: $(TARGET)
 
 test-gencode: $(TARGET)
 	python3 run_gencode_tests.py
+
+-include $(OBJS:.o=.d)

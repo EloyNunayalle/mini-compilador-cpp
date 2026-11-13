@@ -8,6 +8,10 @@
 #include "print_visitor.h"
 #include "type_checker.h"
 #include "gencode.h"
+#include "optimizer.h"
+#include "api.h"
+#include <iterator>
+#include <sstream>
 
 using namespace std;
 
@@ -29,18 +33,72 @@ void mostrarAyuda(const char* prog) {
     cout << "  --check   : Ejecuta el análisis semántico y comprobación de tipos.\n";
     cout << "  --all     : Ejecuta todas las fases del Frontend y genera reportes.\n";
     cout << "  --asm [salida.s] : Genera ensamblador GNU AS (AT&T, Linux x86-64). Por defecto <archivo>.s\n";
+    cout << "  -O0       : Sin optimizaciones (por defecto).\n";
+    cout << "  -O1       : Activa los pases de optimización sobre el AST (inline, fold, sethi).\n";
+    cout << "  --passes a,b : Con -O1, elige los pases (por defecto inline,fold,sethi).\n";
+    cout << "  --report-opt : Con -O1, imprime las transformaciones aplicadas.\n";
+    cout << "  --api --mode <scan|ast|check|asm|all> [-O1] [--passes ...] : lee el código por stdin y emite JSON.\n";
+    cout << "  --version : Muestra la versión.\n";
     cout << "  (por defecto: ejecuta parseo y verificación semántica completa)\n";
 }
 
+static vector<string> splitList(const string& s) {
+    vector<string> out;
+    string cur;
+    for (char c : s) {
+        if (c == ',') {
+            if (!cur.empty()) out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += c;
+        }
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
 int main(int argc, const char* argv[]) {
-    if (argc < 2) {
+    // opciones comunes: -O0/-O1, --passes, --report-opt, --api, --mode, --version
+    vector<string> pos;
+    bool optimize = false, reportOpt = false, apiMode = false;
+    string apiModeName = "all";
+    vector<string> passes;
+    bool passesGiven = false;
+    for (int i = 1; i < argc; i++) {
+        string a = argv[i];
+        if (a == "-O1") optimize = true;
+        else if (a == "-O0") optimize = false;
+        else if (a == "--report-opt") reportOpt = true;
+        else if (a == "--api") apiMode = true;
+        else if (a == "--version") {
+            cout << "mini-compilador-cpp 1.0\n";
+            return 0;
+        } else if (a == "--mode" && i + 1 < argc) apiModeName = argv[++i];
+        else if (a == "--passes" && i + 1 < argc) {
+            passes = splitList(argv[++i]);
+            passesGiven = true;
+        } else pos.push_back(a);
+    }
+    if (!passesGiven) passes = {"inline", "fold", "sethi"};
+
+    if (apiMode) {
+        ApiOptions ao;
+        ao.mode = apiModeName;
+        ao.optimize = optimize;
+        ao.passes = passes;
+        string source((istreambuf_iterator<char>(cin)), istreambuf_iterator<char>());
+        cout << runApi(source, ao) << endl;
+        return 0;
+    }
+
+    if (pos.empty()) {
         mostrarAyuda(argv[0]);
         return 1;
     }
 
-    string archivoEntrada = argv[1];
-    string opcion = (argc >= 3) ? argv[2] : "--default";
-    string archivoSalida = (argc >= 4) ? argv[3] : "";
+    string archivoEntrada = pos[0];
+    string opcion = (pos.size() >= 2) ? pos[1] : "--default";
+    string archivoSalida = (pos.size() >= 3) ? pos[2] : "";
 
     if (archivoEntrada == "-h" || archivoEntrada == "--help") {
         mostrarAyuda(argv[0]);
@@ -114,6 +172,26 @@ int main(int argc, const char* argv[]) {
     }
 
     cout << "\n[ÉXITO] El programa es sintáctica y semánticamente correcto según la gramática EBNF.\n";
+
+    // Optimización opcional (-O1): pases sobre el AST y nueva verificación
+    if (optimize) {
+        OptReport rep;
+        bool ok = runOptimizations(ast, checker, passes, rep);
+        if (!ok) {
+            cerr << "[AVISO] optimización descartada: " << (rep.log.empty() ? "" : rep.log.back()) << "\n";
+            delete ast;
+            Scanner sc2(inputContent.c_str());
+            Parser p2(&sc2);
+            ast = p2.parseProgram();
+            checker.check(ast);
+        } else if (reportOpt) {
+            cout << "\n=== [OPTIMIZACIONES -O1] ===\n";
+            for (const PassResult& r : rep.results) {
+                cout << "  " << r.name << ": " << r.count << " transformaciones\n";
+                for (const string& d : r.details) cout << "    " << d << "\n";
+            }
+        }
+    }
 
     // 4. Generación de código (ensamblador x86-64 AT&T)
     if (opcion == "--asm") {

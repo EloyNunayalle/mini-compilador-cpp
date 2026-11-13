@@ -11,7 +11,8 @@ Marcas dentro del .cpp:
                              (en estos casos no hay ejecucion)
 
 En Linux x86-64 usa gcc local; en otras plataformas usa Docker (gcc para linux/amd64).
-Con --update-expected genera los .expected compilando cada .cpp con g++ real (oraculo).
+Con --update-expected genera los .expected compilando cada .cpp con g++ real (oraculo, sin
+elision de copias: -std=c++14 -fno-elide-constructors, igual que la semantica del compilador).
 Con --asan enlaza con AddressSanitizer y LeakSanitizer y falla si reportan algo.
 """
 import glob
@@ -68,7 +69,7 @@ def actualizar_esperados(nombres):
         src = os.path.join(TEST_DIR, n + ".cpp")
         exe = os.path.join(OUT_DIR, n + ".ref")
         out = os.path.join(TEST_DIR, n + ".expected")
-        lineas.append(f"g++ -std=c++17 -w {src} -o {exe} || {{ echo 'FALLO g++ {n}'; continue; }}")
+        lineas.append(f"g++ -std=c++14 -fno-elide-constructors -w {src} -o {exe} || {{ echo 'FALLO g++ {n}'; continue; }}")
         lineas.append(f"{exe} < {entrada_de(n)} > {out}; echo \"[exit $?]\" >> {out}")
     script = os.path.join(OUT_DIR, "oraculo.sh")
     escribir_script(script, lineas)
@@ -111,7 +112,7 @@ def main():
             if proc.returncode == 0:
                 resultados[n] = "el compilador no detecto el error"
             elif not all(e in salida for e in esperado_error):
-                resultados[n] = "mensaje de error distinto: " + salida.strip().splitlines()[-2][:160]
+                resultados[n] = "mensaje de error distinto: " + " | ".join(salida.strip().splitlines()[-3:])[:200]
             else:
                 resultados[n] = None
             continue

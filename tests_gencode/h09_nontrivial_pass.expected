@@ -1,0 +1,26 @@
+ctor 1
+--1
+copy 2
+in id 2
+copy 3
+copy 4
+dtor 3
+dtor 2
+--2
+ctor 5
+copy 6
+dtor 5
+copy 7
+7
+dtor 7
+dtor 6
+--3
+copy 2
+copy 5
+7
+dtor 5
+dtor 2
+--4
+dtor 4
+dtor 1
+[exit 0]

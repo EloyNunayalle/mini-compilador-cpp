@@ -1,0 +1,23 @@
+A(1)
+copy A 101
+copy A 201
+copy A 101
+porValor 101
+~A 101
+porRef 1
+A(5)
+copy A 105
+105 10
+A(7)
+copy A 107
+~A 7
+copy A 207
+~A 107
+207
+~A 207
+~A 105
+~A 5
+~A 201
+~A 101
+~A 1
+[exit 0]

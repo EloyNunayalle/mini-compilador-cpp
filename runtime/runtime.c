@@ -40,6 +40,15 @@ void rt_str_reset(String *s) {
     s->capacity = 0;
 }
 
+void rt_str_init(String *s) {
+    s->data = NULL;
+    s->size = 0;
+    s->capacity = 0;
+}
+
+void rt_str_init_cstr(String *s, const char *text);
+void rt_str_copy_init(String *dst, const String *src);
+
 void rt_str_free(String *s) {
     rt_str_reset(s);
 }
@@ -89,6 +98,16 @@ void rt_str_assign(String *dst, const String *src) {
         return;
     }
     rt_str_assign_cstr(dst, src->data);
+}
+
+void rt_str_init_cstr(String *s, const char *text) {
+    rt_str_init(s);
+    rt_str_assign_cstr(s, text);
+}
+
+void rt_str_copy_init(String *dst, const String *src) {
+    rt_str_init(dst);
+    rt_str_assign(dst, src);
 }
 
 int rt_str_size(const String *s) {

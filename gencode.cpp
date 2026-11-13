@@ -8,14 +8,13 @@ static const char* R64[6] = {"%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"};
 static const char* R32[6] = {"%edi", "%esi", "%edx", "%ecx", "%r8d", "%r9d"};
 static const char* R8[6]  = {"%dil", "%sil", "%dl", "%cl", "%r8b", "%r9b"};
 
-static Type ptrType() { return Type(Type::VOID, 1, false); }
-static Type boolType() { return Type(Type::BOOL, 0, false); }
 
 Gencode::Gencode(const unordered_map<string, RecordDecl*>& recs)
-    : records(recs), cur(nullptr), curFun(nullptr), pushDepth(0), labelCount(0), constCount(0) {}
+    : records(recs), cur(nullptr), curFun(nullptr), program(nullptr), pushDepth(0), labelCount(0), constCount(0) {}
 
 void Gencode::generate(Program* prog, ostream& out) {
     cur = &text;
+    program = prog;
     prog->accept(this);
 
     out << text.str();
@@ -252,7 +251,444 @@ void Gencode::callRuntime(const string& fn) {
     emitCall(fn + "@PLT");
 }
 
+RecordLayout* Gencode::layoutOf(const Type& t) const {
+    if (t.kind != Type::RECORD) return nullptr;
+    auto it = records.find(t.recordName);
+    return it == records.end() ? nullptr : &it->second->layout;
+}
+
+bool Gencode::needsDtor(const Type& t0) const {
+    Type t = t0;
+    t.arrayDims.clear();
+    if (t.ptrLevel > 0 || t.isRef) return false;
+    if (t.kind == Type::STRING) return true;
+    RecordLayout* L = layoutOf(t);
+    return L && !L->dtorTrivial;
+}
+
+int Gencode::objSize(const Type& t) const {
+    long long count = 1;
+    for (int d : t.arrayDims) count *= d;
+    int es = 8;
+    if (t.isRef || t.ptrLevel > 0) es = 8;
+    else if (t.kind == Type::STRING) es = 16;
+    else if (t.kind == Type::RECORD) es = layoutOf(t)->size;
+    else es = accessSize(t);
+    return static_cast<int>(es * count);
+}
+
+// Lugares de memoria
+
+Gencode::Place Gencode::placeOf(const VarInfo& v) const {
+    Place p;
+    if (v.storage == Storage::GLOBAL) {
+        p.kind = Place::GLOBAL;
+        p.label = v.label;
+    } else if (v.indirect) {
+        p.kind = Place::SLOT_PTR;
+        p.off = v.offset;
+    } else {
+        p.kind = Place::FRAME;
+        p.off = v.offset;
+    }
+    return p;
+}
+
+Gencode::Place Gencode::frameAt(int off) const {
+    Place p;
+    p.kind = Place::FRAME;
+    p.off = off;
+    return p;
+}
+
+Gencode::Place Gencode::thisPlace(int extra) const {
+    Place p;
+    p.kind = Place::THIS_FIELD;
+    p.extra = extra;
+    return p;
+}
+
+Gencode::Place Gencode::plus(const Place& p, int delta) const {
+    Place q = p;
+    q.extra += delta;
+    return q;
+}
+
+bool Gencode::isDirect(const Place& p) const {
+    return p.kind == Place::FRAME || p.kind == Place::GLOBAL;
+}
+
+string Gencode::placeMem(const Place& p) const {
+    if (p.kind == Place::GLOBAL) {
+        if (p.extra == 0) return p.label + "(%rip)";
+        return p.label + "+" + to_string(p.extra) + "(%rip)";
+    }
+    return to_string(p.off + p.extra) + "(%rbp)";
+}
+
+void Gencode::loadAddr(const Place& p, const string& reg) {
+    switch (p.kind) {
+        case Place::FRAME:
+            emit("leaq " + to_string(p.off + p.extra) + "(%rbp), " + reg);
+            break;
+        case Place::GLOBAL:
+            emit("leaq " + placeMem(p) + ", " + reg);
+            break;
+        case Place::THIS_FIELD:
+            emit("movq " + to_string(thisOffset()) + "(%rbp), " + reg);
+            if (p.extra != 0) emit("addq $" + to_string(p.extra) + ", " + reg);
+            break;
+        case Place::SLOT_PTR:
+            emit("movq " + to_string(p.off) + "(%rbp), " + reg);
+            if (p.extra != 0) emit("addq $" + to_string(p.extra) + ", " + reg);
+            break;
+    }
+}
+
+// Guarda el valor de %rax o %xmm0 en el lugar dado
+void Gencode::storeToPlace(const Type& t, const Place& p) {
+    if (isDirect(p)) {
+        storeTo(t, placeMem(p));
+        return;
+    }
+    pushTemp(t);
+    loadAddr(p, "%rcx");
+    popToResult(t);
+    storeTo(t, "(%rcx)");
+}
+
+void Gencode::zeroFill(const Place& p, int size) {
+    loadAddr(p, "%rdi");
+    emit("xorl %eax, %eax");
+    emit("movq $" + to_string(size) + ", %rcx");
+    emit("rep stosb");
+}
+
+// Carga n bytes (1 a 8) desde off(base) en %rcx, con los bytes altos en cero
+void Gencode::loadPartial(const string& base, int off, int n) {
+    auto m = [&](int d) { return to_string(off + d) + "(" + base + ")"; };
+    switch (n) {
+        case 8: emit("movq " + m(0) + ", %rcx"); break;
+        case 4: emit("movl " + m(0) + ", %ecx"); break;
+        case 2: emit("movzwl " + m(0) + ", %ecx"); break;
+        case 1: emit("movzbl " + m(0) + ", %ecx"); break;
+        case 3:
+            emit("movzwl " + m(0) + ", %ecx");
+            emit("movzbl " + m(2) + ", %r10d");
+            emit("shll $16, %r10d");
+            emit("orl %r10d, %ecx");
+            break;
+        case 5:
+            emit("movl " + m(0) + ", %ecx");
+            emit("movzbl " + m(4) + ", %r10d");
+            emit("shlq $32, %r10");
+            emit("orq %r10, %rcx");
+            break;
+        case 6:
+            emit("movl " + m(0) + ", %ecx");
+            emit("movzwl " + m(4) + ", %r10d");
+            emit("shlq $32, %r10");
+            emit("orq %r10, %rcx");
+            break;
+        default:
+            emit("movl " + m(0) + ", %ecx");
+            emit("movzwl " + m(4) + ", %r10d");
+            emit("movzbl " + m(6) + ", %r11d");
+            emit("shll $16, %r11d");
+            emit("orl %r11d, %r10d");
+            emit("shlq $32, %r10");
+            emit("orq %r10, %rcx");
+            break;
+    }
+}
+
+// Escribe los n bytes bajos de src64 (1 a 8) en off(base) sin tocar mas memoria
+void Gencode::storePartial(const string& src64, const string& base, int off, int n) {
+    emit("movq " + src64 + ", %r10");
+    int pos = 0;
+    int rem = n;
+    while (rem > 0) {
+        int c = rem >= 8 ? 8 : rem >= 4 ? 4 : rem >= 2 ? 2 : 1;
+        string mem = to_string(off + pos) + "(" + base + ")";
+        if (c == 8) emit("movq %r10, " + mem);
+        else if (c == 4) emit("movl %r10d, " + mem);
+        else if (c == 2) emit("movw %r10w, " + mem);
+        else emit("movb %r10b, " + mem);
+        rem -= c;
+        pos += c;
+        if (rem > 0) emit("shrq $" + to_string(c * 8) + ", %r10");
+    }
+}
+
+// Ciclo de vida de objetos
+
+// Aplica la operacion sobre el objeto de tipo t: %rdi es el destino y %rsi el origen
+void Gencode::genOp(OpKind op, const Type& t) {
+    if (t.isArray()) {
+        Type et = t.elementType();
+        int esz = objSize(et);
+        int n = t.arrayDims[0];
+        bool classElem = (et.kind == Type::RECORD || et.kind == Type::STRING) && et.ptrLevel == 0 && !et.isRef;
+        RecordLayout* el = layoutOf(et);
+        bool trivial = true;
+        if (classElem) {
+            if (et.kind == Type::STRING) trivial = false;
+            else if (op == OP_DEFAULT) trivial = el->defaultTrivial;
+            else if (op == OP_COPY) trivial = el->copyTrivial;
+            else if (op == OP_ASSIGN) trivial = el->assignTrivial;
+            else trivial = el->dtorTrivial;
+        }
+        if (et.isArray()) trivial = false;
+        if (trivial) {
+            if (op == OP_COPY || op == OP_ASSIGN) copyBytes("%rsi", "%rdi", objSize(t));
+            return;
+        }
+        string lloop = newLabel("aop");
+        string ldone = newLabel("aopend");
+        bool twoPtr = (op == OP_COPY || op == OP_ASSIGN);
+        emit("pushq %rdi");
+        emit("pushq %rsi");
+        pushDepth += 2;
+        if (op == OP_DESTROY) {
+            emit("pushq $" + to_string(n));
+            pushDepth++;
+            label(lloop);
+            emit("cmpq $0, (%rsp)");
+            emit("je " + ldone);
+            emit("decq (%rsp)");
+        } else {
+            emit("pushq $0");
+            pushDepth++;
+            label(lloop);
+            emit("cmpq $" + to_string(n) + ", (%rsp)");
+            emit("jge " + ldone);
+        }
+        emit("movq (%rsp), %rax");
+        emit("imulq $" + to_string(esz) + ", %rax");
+        emit("movq 16(%rsp), %rdi");
+        emit("addq %rax, %rdi");
+        if (twoPtr) {
+            emit("movq 8(%rsp), %rsi");
+            emit("addq %rax, %rsi");
+        }
+        genOp(op, et);
+        if (op != OP_DESTROY) emit("incq (%rsp)");
+        emit("jmp " + lloop);
+        label(ldone);
+        emit("addq $24, %rsp");
+        pushDepth -= 3;
+        return;
+    }
+
+    bool isClass = (t.kind == Type::RECORD || t.kind == Type::STRING) && t.ptrLevel == 0 && !t.isRef;
+    if (!isClass) {
+        if (op == OP_COPY || op == OP_ASSIGN) copyBytes("%rsi", "%rdi", objSize(t));
+        return;
+    }
+    if (t.kind == Type::STRING) {
+        switch (op) {
+            case OP_DEFAULT: callRuntime("rt_str_init"); break;
+            case OP_COPY:    callRuntime("rt_str_copy_init"); break;
+            case OP_ASSIGN:  callRuntime("rt_str_assign"); break;
+            case OP_DESTROY: callRuntime("rt_str_free"); break;
+        }
+        return;
+    }
+    RecordLayout* L = layoutOf(t);
+    FunDecl* f = nullptr;
+    switch (op) {
+        case OP_DEFAULT: f = L->defaultCtor; break;
+        case OP_COPY:    f = L->copyCtor; break;
+        case OP_ASSIGN:  f = L->copyAssign; break;
+        case OP_DESTROY: f = L->dtor; break;
+    }
+    if (f) {
+        emitCall(f->layout.label);
+    } else if (op == OP_COPY || op == OP_ASSIGN) {
+        copyBytes("%rsi", "%rdi", L->size);
+    }
+}
+
+void Gencode::registerTemp(int offset, const Type& t) {
+    if (needsDtor(t)) tempStack.push_back({frameAt(offset), t});
+}
+
+void Gencode::saveLive(const Type* live) {
+    if (!live) return;
+    pushTemp(*live);
+}
+
+void Gencode::restoreLive(const Type* live) {
+    if (!live) return;
+    popToResult(*live);
+}
+
+void Gencode::emitCleanupItems(const vector<CleanupItem>& items) {
+    for (size_t i = items.size(); i > 0; i--) {
+        const CleanupItem& it = items[i - 1];
+        loadAddr(it.place, "%rdi");
+        genOp(OP_DESTROY, it.type);
+    }
+}
+
+// Destruye los temporales creados desde mark, en orden inverso. live es el valor
+// que hay que conservar en %rax o %xmm0 mientras corren los destructores.
+void Gencode::flushTemps(size_t mark, const Type* live) {
+    if (tempStack.size() <= mark) return;
+    saveLive(live);
+    vector<CleanupItem> items(tempStack.begin() + mark, tempStack.end());
+    tempStack.resize(mark);
+    emitCleanupItems(items);
+    restoreLive(live);
+}
+
+// Un temporal enlazado a una referencia const vive hasta el fin del scope
+void Gencode::moveTempsToScope(size_t mark) {
+    for (size_t i = mark; i < tempStack.size(); i++) {
+        if (scopes.empty()) globalDtors.push_back(tempStack[i]);
+        else scopes.back().push_back(tempStack[i]);
+    }
+    tempStack.resize(mark);
+}
+
+// Destruye los objetos de los scopes desde el mas interno hasta downTo, sin cerrarlos
+void Gencode::emitScopeCleanup(size_t downTo, const Type* live) {
+    bool any = false;
+    for (size_t s = downTo; s < scopes.size(); s++) {
+        if (!scopes[s].empty()) any = true;
+    }
+    if (!any) return;
+    saveLive(live);
+    for (size_t s = scopes.size(); s > downTo; s--) {
+        emitCleanupItems(scopes[s - 1]);
+    }
+    restoreLive(live);
+}
+
+void Gencode::pushScope() {
+    scopes.push_back(vector<CleanupItem>());
+}
+
+void Gencode::popScope() {
+    scopes.pop_back();
+}
+
+// Inicializa un objeto nuevo de tipo t en pl segun el plan del TypeChecker
+void Gencode::genInitObject(const Type& t, const InitSpec& sp, const Place& pl) {
+    switch (sp.kind) {
+        case IK_NONE:
+            return;
+        case IK_VALUE:
+            if (!sp.expr) {
+                zeroFill(pl, objSize(t));
+            } else {
+                genInitFromExpr(t, sp.expr, pl);
+            }
+            return;
+        case IK_REF: {
+            Type pt(Type::VOID, 1, false);
+            if (sp.tempOffset != 0) {
+                Type tb = t.withoutRef().withoutConst();
+                if (tb.isString()) {
+                    sp.expr->accept(this);
+                    emit("movq %rax, %rsi");
+                    emit("leaq " + to_string(sp.tempOffset) + "(%rbp), %rdi");
+                    callRuntime("rt_str_init_cstr");
+                    registerTemp(sp.tempOffset, tb);
+                } else {
+                    Type vt = sp.expr->accept(this);
+                    convert(vt, tb);
+                    storeTo(tb, to_string(sp.tempOffset) + "(%rbp)");
+                }
+                emit("leaq " + to_string(sp.tempOffset) + "(%rbp), %rax");
+            } else {
+                genObjAddr(sp.expr);
+            }
+            storeToPlace(pt, pl);
+            return;
+        }
+        case IK_DEFAULT:
+            loadAddr(pl, "%rdi");
+            genOp(OP_DEFAULT, t);
+            return;
+        case IK_COPY:
+            genObjAddr(sp.expr);
+            emit("movq %rax, %rsi");
+            loadAddr(pl, "%rdi");
+            genOp(OP_COPY, t);
+            return;
+        case IK_CTOR: {
+            vector<ArgSpec> args;
+            const FunctionLayout& L = sp.ctor->layout;
+            ArgSpec th;
+            th.kind = AK_PLACE;
+            th.place = pl;
+            th.abi = &L.paramAbi[0];
+            args.push_back(th);
+            for (size_t i = 0; i < sp.args.size(); i++) {
+                ArgSpec a;
+                a.kind = AK_VALUE;
+                a.exp = sp.args[i];
+                a.info = sp.argInfo[i];
+                a.abi = &L.paramAbi[i + 1];
+                args.push_back(a);
+            }
+            genCallWith(args, L.stackArgBytes, L.label);
+            return;
+        }
+        case IK_BRACED:
+            genBraced(t, static_cast<BracedInitList*>(sp.expr), pl, true);
+            return;
+    }
+}
+
+// Construye un objeto de tipo t en pl copiando o convirtiendo desde la expresion e
+void Gencode::genInitFromExpr(const Type& t, Exp* e, const Place& pl) {
+    if (e->nodeKind() == NodeKind::BRACED_INIT) {
+        genBraced(t, static_cast<BracedInitList*>(e), pl, false);
+        return;
+    }
+    if (t.isString()) {
+        Type vt = e->accept(this);
+        emit("movq %rax, %rsi");
+        loadAddr(pl, "%rdi");
+        callRuntime(vt.isString() ? "rt_str_copy_init" : "rt_str_init_cstr");
+    } else if (t.isRecord()) {
+        genObjAddr(e);
+        emit("movq %rax, %rsi");
+        loadAddr(pl, "%rdi");
+        genOp(OP_COPY, t);
+    } else {
+        Type vt = e->accept(this);
+        convert(vt, t);
+        storeToPlace(t, pl);
+    }
+}
+
+void Gencode::genBraced(const Type& t, BracedInitList* bl, const Place& pl, bool top) {
+    if (top) zeroFill(pl, objSize(t));
+    for (size_t i = 0; i < bl->elements.size() && i < bl->elementTypes.size(); i++) {
+        genInitFromExpr(bl->elementTypes[i], bl->elements[i], plus(pl, bl->elementOffsets[i]));
+    }
+    for (const BracedInitList::Omitted& om : bl->omitted) {
+        Place sub = plus(pl, om.offset);
+        if (om.spec.kind == IK_DEFAULT) {
+            Type at = om.type;
+            if (om.count > 1) at.arrayDims = {om.count};
+            loadAddr(sub, "%rdi");
+            genOp(OP_DEFAULT, at);
+        } else if (om.spec.expr) {
+            genInitFromExpr(om.type, om.spec.expr, sub);
+        }
+    }
+}
+
 // Direcciones (lvalues)
+
+void Gencode::genObjAddr(Exp* e) {
+    if (e->isLValue) genAddr(e);
+    else e->accept(this);
+}
 
 void Gencode::genAddr(Exp* e) {
     switch (e->nodeKind()) {
@@ -261,6 +697,7 @@ void Gencode::genAddr(Exp* e) {
             if (id->idKind == ID_FIELD) {
                 emit("movq " + to_string(thisOffset()) + "(%rbp), %rax");
                 emit("addq $" + to_string(id->var.offset) + ", %rax");
+                if (id->isRefVar) emit("movq (%rax), %rax");
             } else if (id->idKind == ID_VAR) {
                 emit(string(id->isRefVar ? "movq " : "leaq ") + varMem(id->var) + ", %rax");
             } else {
@@ -273,17 +710,20 @@ void Gencode::genAddr(Exp* e) {
             u->exp->accept(this);
             return;
         }
+        case NodeKind::ASSIGN_EXP:
+            e->accept(this);
+            return;
         case NodeKind::POSTFIX_EXP: {
             PostfixExp* pf = static_cast<PostfixExp*>(e);
             switch (pf->kind) {
                 case ARRAY_ACCESS: {
                     if (pf->base->inferredType.isString()) {
-                        genAddr(pf->base);
+                        genObjAddr(pf->base);
                         emit("movq (%rax), %rax");
                     } else {
                         pf->base->accept(this);
                     }
-                    pushTemp(ptrType());
+                    pushTemp(Type(Type::VOID, 1, false));
                     pf->indexExp->accept(this);
                     emit("movslq %eax, %rax");
                     emit("imulq $" + to_string(pf->elemSize) + ", %rax");
@@ -293,12 +733,14 @@ void Gencode::genAddr(Exp* e) {
                     return;
                 }
                 case DOT_ACCESS:
-                    genAddr(pf->base);
+                    genObjAddr(pf->base);
                     emit("addq $" + to_string(pf->fieldOffset) + ", %rax");
+                    if (pf->fieldIsRef) emit("movq (%rax), %rax");
                     return;
                 case ARROW_ACCESS:
                     pf->base->accept(this);
                     emit("addq $" + to_string(pf->fieldOffset) + ", %rax");
+                    if (pf->fieldIsRef) emit("movq (%rax), %rax");
                     return;
                 case CALL_ACCESS:
                     genCallExp(pf);
@@ -314,7 +756,15 @@ void Gencode::genAddr(Exp* e) {
 
 void Gencode::genBool(Exp* e) {
     Type t = e->accept(this);
-    convert(t, boolType());
+    convert(t, Type(Type::BOOL, 0, false));
+}
+
+// Condicion: los temporales de la expresion se destruyen antes de decidir el salto
+void Gencode::genCond(Exp* e) {
+    size_t m = tempStack.size();
+    genBool(e);
+    Type b(Type::BOOL, 0, false);
+    flushTemps(m, &b);
 }
 
 // Expresiones
@@ -486,14 +936,17 @@ Type Gencode::visit(AssignExp* exp) {
     }
 
     if (tt.isRecord()) {
-        exp->value->accept(this);
-        pushTemp(ptrType());
+        // valor, luego destino; el resultado es la direccion del destino
+        genObjAddr(exp->value);
+        pushTemp(Type(Type::VOID, 1, false));
         genAddr(exp->target);
-        emit("movq %rax, %rcx");
-        emit("popq %rdx");
-        pushDepth--;
-        copyBytes("%rdx", "%rcx", records.at(tt.recordName)->layout.size);
-        emit("movq %rcx, %rax");
+        pushTemp(Type(Type::VOID, 1, false));
+        emit("movq (%rsp), %rdi");
+        emit("movq 8(%rsp), %rsi");
+        genOp(OP_ASSIGN, tt);
+        emit("popq %rax");
+        emit("addq $8, %rsp");
+        pushDepth -= 2;
         return exp->inferredType;
     }
 
@@ -509,7 +962,7 @@ Type Gencode::visit(AssignExp* exp) {
 
 void Gencode::genAssignString(AssignExp* e) {
     genAddr(e->target);
-    pushTemp(ptrType());
+    pushTemp(Type(Type::VOID, 1, false));
     Type vt = e->value->accept(this);
     emit("movq %rax, %rsi");
     emit("movq (%rsp), %rdi");
@@ -519,22 +972,135 @@ void Gencode::genAssignString(AssignExp* e) {
 }
 
 Type Gencode::visit(NewExp* exp) {
-    if (exp->arrayDims.empty()) {
+    Type t = exp->allocType;
+    bool isArr = !exp->arrayDims.empty();
+    Type ptrT(Type::VOID, 1, false);
+    bool classLike = (exp->ptrTemp != 0);
+
+    if (!isArr) {
         emit("movl $" + to_string(exp->elemSize) + ", %edi");
-    } else {
-        exp->arrayDims[0]->accept(this);
-        emit("movslq %eax, %rax");
+        callRuntime("malloc");
+        if (!classLike) return exp->inferredType;
+        string slot = to_string(exp->ptrTemp) + "(%rbp)";
+        emit("movq %rax, " + slot);
+        Place obj;
+        obj.kind = Place::SLOT_PTR;
+        obj.off = exp->ptrTemp;
+        if (exp->spec.kind == IK_VALUE) {
+            Type vt = exp->spec.expr->accept(this);
+            convert(vt, t);
+            storeToPlace(t, obj);
+        } else {
+            if (exp->valueInit) zeroFill(obj, exp->elemSize);
+            if (exp->spec.kind != IK_NONE) {
+                size_t mark = tempStack.size();
+                genInitObject(t, exp->spec, obj);
+                flushTemps(mark, nullptr);
+            }
+        }
+        emit("movq " + slot + ", %rax");
+        return exp->inferredType;
+    }
+
+    // new T[n]
+    exp->arrayDims[0]->accept(this);
+    emit("movslq %eax, %rax");
+    if (!classLike) {
         emit("imulq $" + to_string(exp->elemSize) + ", %rax");
         emit("movq %rax, %rdi");
+        callRuntime("malloc");
+        return exp->inferredType;
     }
+    emit("pushq %rax");
+    pushDepth++;
+    emit("movq %rax, %rdi");
+    emit("imulq $" + to_string(exp->elemSize) + ", %rdi");
+    if (exp->hasCookie) emit("addq $16, %rdi");
     callRuntime("malloc");
+    if (exp->hasCookie) {
+        emit("movq (%rsp), %rcx");
+        emit("movq %rcx, (%rax)");
+        emit("addq $16, %rax");
+    }
+    emit("movq %rax, " + to_string(exp->ptrTemp) + "(%rbp)");
+    if (exp->spec.kind == IK_DEFAULT) {
+        string lloop = newLabel("newloop");
+        string ldone = newLabel("newend");
+        emit("pushq %rax");
+        emit("pushq $0");
+        pushDepth += 2;
+        label(lloop);
+        emit("movq (%rsp), %rax");
+        emit("cmpq 16(%rsp), %rax");
+        emit("jge " + ldone);
+        emit("imulq $" + to_string(exp->elemSize) + ", %rax");
+        emit("movq 8(%rsp), %rdi");
+        emit("addq %rax, %rdi");
+        genOp(OP_DEFAULT, t);
+        emit("incq (%rsp)");
+        emit("jmp " + lloop);
+        label(ldone);
+        emit("addq $16, %rsp");
+        pushDepth -= 2;
+    }
+    emit("addq $8, %rsp");
+    pushDepth--;
+    emit("movq " + to_string(exp->ptrTemp) + "(%rbp), %rax");
     return exp->inferredType;
 }
 
 Type Gencode::visit(DeleteExp* exp) {
     exp->exp->accept(this);
-    emit("movq %rax, %rdi");
-    callRuntime("free");
+    Type pt = exp->pointeeType;
+    bool dtor = needsDtor(pt);
+
+    if (!dtor) {
+        emit("movq %rax, %rdi");
+        callRuntime("free");
+        return exp->inferredType;
+    }
+
+    string ldone = newLabel("delend");
+    emit("testq %rax, %rax");
+    emit("je " + ldone);
+    emit("pushq %rax");
+    pushDepth++;
+    if (!exp->isArray) {
+        emit("movq %rax, %rdi");
+        genOp(OP_DESTROY, pt);
+        emit("popq %rdi");
+        pushDepth--;
+        callRuntime("free");
+    } else if (exp->hasCookie) {
+        string lloop = newLabel("delloop");
+        string lfree = newLabel("delfree");
+        int esz = objSize(pt);
+        emit("movq -16(%rax), %rcx");
+        emit("pushq %rcx");
+        pushDepth++;
+        label(lloop);
+        emit("cmpq $0, (%rsp)");
+        emit("je " + lfree);
+        emit("decq (%rsp)");
+        emit("movq (%rsp), %rax");
+        emit("imulq $" + to_string(esz) + ", %rax");
+        emit("movq 8(%rsp), %rdi");
+        emit("addq %rax, %rdi");
+        genOp(OP_DESTROY, pt);
+        emit("jmp " + lloop);
+        label(lfree);
+        emit("addq $8, %rsp");
+        pushDepth--;
+        emit("popq %rdi");
+        pushDepth--;
+        emit("subq $16, %rdi");
+        callRuntime("free");
+    } else {
+        emit("popq %rdi");
+        pushDepth--;
+        callRuntime("free");
+    }
+    label(ldone);
     return exp->inferredType;
 }
 
@@ -556,7 +1122,7 @@ Type Gencode::visit(BinaryExp* exp) {
         case BM_PTR_PLUS_INT:
         case BM_PTR_MINUS_INT: {
             exp->left->accept(this);
-            pushTemp(ptrType());
+            pushTemp(Type(Type::VOID, 1, false));
             exp->right->accept(this);
             emit("movslq %eax, %rax");
             emit("imulq $" + to_string(exp->ptrScale) + ", %rax");
@@ -570,7 +1136,7 @@ Type Gencode::visit(BinaryExp* exp) {
             exp->left->accept(this);
             emit("movslq %eax, %rax");
             emit("imulq $" + to_string(exp->ptrScale) + ", %rax");
-            pushTemp(ptrType());
+            pushTemp(Type(Type::VOID, 1, false));
             exp->right->accept(this);
             emit("popq %rcx");
             pushDepth--;
@@ -579,7 +1145,7 @@ Type Gencode::visit(BinaryExp* exp) {
         }
         case BM_PTR_DIFF: {
             exp->left->accept(this);
-            pushTemp(ptrType());
+            pushTemp(Type(Type::VOID, 1, false));
             exp->right->accept(this);
             emit("movq %rax, %rcx");
             emit("popq %rax");
@@ -622,7 +1188,7 @@ void Gencode::genLogic(BinaryExp* e) {
     genBool(e->left);
     emit("testl %eax, %eax");
     emit(string(isAnd ? "je " : "jne ") + lshort);
-    genBool(e->right);
+    genCond(e->right);
     emit("testl %eax, %eax");
     emit(string(isAnd ? "je " : "jne ") + lshort);
     emit(string("movl $") + (isAnd ? "1" : "0") + ", %eax");
@@ -756,7 +1322,7 @@ void Gencode::genArith(BinaryExp* e) {
 
 void Gencode::genStrCompare(BinaryExp* e) {
     e->left->accept(this);
-    pushTemp(ptrType());
+    pushTemp(Type(Type::VOID, 1, false));
     e->right->accept(this);
     switch (e->mode) {
         case BM_STR_STR:
@@ -849,7 +1415,7 @@ Type Gencode::visit(PostfixExp* exp) {
             break;
         case CALL_ACCESS:
             genCallExp(exp);
-            if (exp->callee && exp->callee->layout.returnType.isRef) {
+            if (exp->callKind != CALL_CTOR && exp->callee && exp->callee->layout.returnType.isRef) {
                 loadFrom(exp->inferredType, "(%rax)");
             }
             break;
@@ -857,104 +1423,295 @@ Type Gencode::visit(PostfixExp* exp) {
     return exp->inferredType;
 }
 
+static bool byValueClass(const Type& t) {
+    return (t.kind == Type::RECORD || t.kind == Type::STRING) && t.ptrLevel == 0 && !t.isRef && t.arrayDims.empty();
+}
+
+void Gencode::storeReturnedRegs(const AbiLoc& ra, int tempOffset) {
+    for (int k = 0; k < ra.neight; k++) {
+        int n = ra.size - 8 * k;
+        if (n > 8) n = 8;
+        string base = "%rbp";
+        int off = tempOffset + 8 * k;
+        if (ra.cls[k] == AbiClass::SSE) {
+            string x = "%xmm" + to_string(ra.reg[k]);
+            emit(string(n == 4 ? "movss " : "movsd ") + x + ", " + to_string(off) + "(%rbp)");
+        } else {
+            storePartial(ra.reg[k] == 0 ? "%rax" : "%rdx", base, off, n);
+        }
+    }
+}
+
+// T(args): construye un temporal del marco
+void Gencode::genConstructTemp(PostfixExp* call) {
+    Type rec = call->inferredType;
+    Place pl = frameAt(call->retTemp);
+    switch (call->ctorKind) {
+        case IK_COPY:
+            genObjAddr(call->args[0]);
+            emit("movq %rax, %rsi");
+            loadAddr(pl, "%rdi");
+            genOp(OP_COPY, rec);
+            break;
+        case IK_CTOR: {
+            vector<ArgSpec> args;
+            const FunctionLayout& L = call->callee->layout;
+            ArgSpec th;
+            th.kind = AK_PLACE;
+            th.place = pl;
+            th.abi = &L.paramAbi[0];
+            args.push_back(th);
+            for (size_t i = 0; i < call->args.size(); i++) {
+                ArgSpec a;
+                a.kind = AK_VALUE;
+                a.exp = call->args[i];
+                a.info = call->argInfo[i];
+                a.abi = &L.paramAbi[i + 1];
+                args.push_back(a);
+            }
+            genCallWith(args, L.stackArgBytes, L.label);
+            break;
+        }
+        default:
+            // T(): inicializacion por valor, pone a cero y luego construye
+            if (!call->callee || call->callee->isImplicit) zeroFill(pl, objSize(rec));
+            if (call->callee) {
+                loadAddr(pl, "%rdi");
+                emitCall(call->callee->layout.label);
+            }
+            break;
+    }
+    registerTemp(call->retTemp, rec);
+    emit("leaq " + to_string(call->retTemp) + "(%rbp), %rax");
+}
+
 void Gencode::genCallExp(PostfixExp* call) {
     if (call->callKind == CALL_BUILTIN) {
         genBuiltin(call);
         return;
     }
+    if (call->callKind == CALL_CTOR) {
+        genConstructTemp(call);
+        return;
+    }
 
     FunDecl* fd = call->callee;
+    const FunctionLayout& L = fd->layout;
     vector<ArgSpec> args;
     size_t off = 0;
 
+    static AbiLoc hiddenAbi;
+    hiddenAbi.pass = Pass::INT_REG;
+    hiddenAbi.reg[0] = 0;
+    if (L.retAbi.pass == Pass::HIDDEN_PTR) {
+        ArgSpec h;
+        h.kind = AK_TEMP_ADDR;
+        h.tempOffset = call->retTemp;
+        h.abi = &hiddenAbi;
+        args.push_back(h);
+    }
     if (call->callKind == CALL_METHOD) {
         PostfixExp* pf = static_cast<PostfixExp*>(call->base);
-        args.push_back({pf->kind == ARROW_ACCESS ? AK_THIS_PTR : AK_THIS_ADDR, pf->base, ptrType(), false});
+        ArgSpec th;
+        th.kind = (pf->kind == ARROW_ACCESS) ? AK_THIS_PTR : AK_THIS_ADDR;
+        th.exp = pf->base;
+        th.abi = &L.paramAbi[0];
+        args.push_back(th);
         off = 1;
     } else if (call->callKind == CALL_METHOD_IMPLICIT) {
-        args.push_back({AK_THIS_IMPLICIT, nullptr, ptrType(), false});
+        ArgSpec th;
+        th.kind = AK_THIS_IMPLICIT;
+        th.abi = &L.paramAbi[0];
+        args.push_back(th);
         off = 1;
     }
     for (size_t i = 0; i < call->args.size(); i++) {
-        Type pt = fd->layout.params[i + off].type;
-        args.push_back({AK_VALUE, call->args[i], pt, pt.isRef});
+        ArgSpec a;
+        a.kind = AK_VALUE;
+        a.exp = call->args[i];
+        a.info = call->argInfo[i];
+        a.abi = &L.paramAbi[i + off];
+        args.push_back(a);
     }
-    genCallArgs(args, fd->layout.label);
+    genCallWith(args, L.stackArgBytes, L.label);
+
+    const Type& rt = L.returnType;
+    if (!rt.isRef && byValueClass(rt)) {
+        if (L.retAbi.pass == Pass::AGG_REGS) storeReturnedRegs(L.retAbi, call->retTemp);
+        registerTemp(call->retTemp, rt);
+        emit("leaq " + to_string(call->retTemp) + "(%rbp), %rax");
+    }
 }
 
-// Evalua los argumentos en orden como temporales en la pila, reserva el area de
-// argumentos en pila (alineada) y carga los registros segun System V AMD64.
-void Gencode::genCallArgs(vector<ArgSpec>& args, const string& target) {
+// Evalua los argumentos en orden y los deja como palabras de 8 bytes en la pila,
+// reserva el area de argumentos en pila (alineada) y carga los registros segun la
+// clasificacion ABI que dejo el TypeChecker.
+void Gencode::genCallWith(vector<ArgSpec>& args, int stackArgBytes, const string& target) {
     int n = static_cast<int>(args.size());
+    vector<int> firstG(n, 0), nwords(n, 0);
+    int W = 0;
 
-    for (ArgSpec& a : args) {
+    for (int i = 0; i < n; i++) {
+        ArgSpec& a = args[i];
+        const AbiLoc& abi = *a.abi;
+        int k = 1;
+        bool floatVal = false;
+        Type ft;
+        bool agg = false;
+
         switch (a.kind) {
             case AK_THIS_ADDR:
-                genAddr(a.exp);
-                pushTemp(ptrType());
+                genObjAddr(a.exp);
                 break;
             case AK_THIS_PTR:
                 a.exp->accept(this);
-                pushTemp(ptrType());
                 break;
             case AK_THIS_IMPLICIT:
                 emit("movq " + to_string(thisOffset()) + "(%rbp), %rax");
-                pushTemp(ptrType());
                 break;
-            case AK_VALUE:
-                if (a.byAddr) {
-                    genAddr(a.exp);
-                    pushTemp(ptrType());
-                } else {
-                    Type vt = a.exp->accept(this);
-                    convert(vt, a.ptype);
-                    pushTemp(a.ptype);
+            case AK_PLACE:
+                loadAddr(a.place, "%rax");
+                break;
+            case AK_TEMP_ADDR:
+                emit("leaq " + to_string(a.tempOffset) + "(%rbp), %rax");
+                break;
+            case AK_VALUE: {
+                const ArgInfo& ai = a.info;
+                switch (ai.mode) {
+                    case AM_VALUE: {
+                        Type vt = a.exp->accept(this);
+                        convert(vt, ai.ptype);
+                        Cls c = cls(ai.ptype);
+                        if (c == C_FLOAT || c == C_DOUBLE) {
+                            floatVal = true;
+                            ft = ai.ptype;
+                        }
+                        break;
+                    }
+                    case AM_REF:
+                        genObjAddr(a.exp);
+                        break;
+                    case AM_REF_TEMP: {
+                        Type tb = ai.ptype.withoutRef().withoutConst();
+                        if (tb.isString()) {
+                            a.exp->accept(this);
+                            emit("movq %rax, %rsi");
+                            emit("leaq " + to_string(ai.tempOffset) + "(%rbp), %rdi");
+                            callRuntime("rt_str_init_cstr");
+                            registerTemp(ai.tempOffset, tb);
+                        } else {
+                            Type vt = a.exp->accept(this);
+                            convert(vt, tb);
+                            storeTo(tb, to_string(ai.tempOffset) + "(%rbp)");
+                        }
+                        emit("leaq " + to_string(ai.tempOffset) + "(%rbp), %rax");
+                        break;
+                    }
+                    case AM_COPY: {
+                        Type tt = ai.ptype.withoutRef().withoutConst();
+                        if (tt.isString() && !a.exp->inferredType.withoutRef().isString()) {
+                            a.exp->accept(this);
+                            emit("movq %rax, %rsi");
+                            emit("leaq " + to_string(ai.tempOffset) + "(%rbp), %rdi");
+                            callRuntime("rt_str_init_cstr");
+                        } else {
+                            genObjAddr(a.exp);
+                            emit("movq %rax, %rsi");
+                            emit("leaq " + to_string(ai.tempOffset) + "(%rbp), %rdi");
+                            genOp(OP_COPY, tt);
+                        }
+                        registerTemp(ai.tempOffset, tt);
+                        emit("leaq " + to_string(ai.tempOffset) + "(%rbp), %rax");
+                        break;
+                    }
+                    case AM_AGG:
+                        genObjAddr(a.exp);
+                        agg = true;
+                        break;
                 }
                 break;
+            }
         }
-    }
 
-    vector<int> reg(n, -1);
-    vector<bool> flt(n, false);
-    int ni = 0, nf = 0, nstack = 0;
-    for (int i = 0; i < n; i++) {
-        const ArgSpec& a = args[i];
-        Cls c = cls(a.ptype);
-        flt[i] = (a.kind == AK_VALUE && !a.byAddr && (c == C_FLOAT || c == C_DOUBLE));
-        if (flt[i]) {
-            if (nf < 8) reg[i] = nf++;
-            else nstack++;
+        if (agg) {
+            if (abi.pass == Pass::AGG_REGS) k = abi.neight;
+            else if (abi.pass == Pass::STACK) k = abi.stackBytes / 8;
+            else k = 0;
+            for (int j = k - 1; j >= 0; j--) {
+                int nb = abi.size - 8 * j;
+                if (nb > 8) nb = 8;
+                loadPartial("%rax", 8 * j, nb);
+                emit("pushq %rcx");
+                pushDepth++;
+            }
+        } else if (floatVal) {
+            pushTemp(ft);
         } else {
-            if (ni < 6) reg[i] = ni++;
-            else nstack++;
+            emit("pushq %rax");
+            pushDepth++;
         }
+        firstG[i] = W;
+        nwords[i] = k;
+        W += k;
     }
 
-    int pad = ((pushDepth + nstack) % 2 != 0) ? 8 : 0;
-    int S = 8 * nstack + pad;
+    int pad = ((pushDepth + stackArgBytes / 8) % 2 != 0) ? 8 : 0;
+    int S = stackArgBytes + pad;
     if (S > 0) {
         emit("subq $" + to_string(S) + ", %rsp");
         pushDepth += S / 8;
     }
 
-    int j = 0;
+    auto wordAddr = [&](int i, int j) {
+        int g = firstG[i] + (nwords[i] - 1 - j);
+        return to_string(S + 8 * (W - 1 - g)) + "(%rsp)";
+    };
+
     for (int i = 0; i < n; i++) {
-        if (reg[i] >= 0) continue;
-        emit("movq " + to_string(S + 8 * (n - 1 - i)) + "(%rsp), %r10");
-        emit("movq %r10, " + to_string(8 * j) + "(%rsp)");
-        j++;
+        const AbiLoc& abi = *args[i].abi;
+        bool onStack = (abi.pass == Pass::STACK) || (abi.pass == Pass::INVISIBLE_REF && abi.reg[0] < 0);
+        if (onStack) {
+            for (int j = 0; j < nwords[i]; j++) {
+                emit("movq " + wordAddr(i, j) + ", %r10");
+                emit("movq %r10, " + to_string(abi.stackOffset + 8 * j) + "(%rsp)");
+            }
+        }
     }
     for (int i = 0; i < n; i++) {
-        if (reg[i] < 0) continue;
-        string src = to_string(S + 8 * (n - 1 - i)) + "(%rsp)";
-        if (flt[i]) emit("movsd " + src + ", %xmm" + to_string(reg[i]));
-        else emit("movq " + src + ", " + R64[reg[i]]);
+        const AbiLoc& abi = *args[i].abi;
+        switch (abi.pass) {
+            case Pass::INT_REG:
+            case Pass::INVISIBLE_REF:
+                if (abi.reg[0] >= 0) emit("movq " + wordAddr(i, 0) + ", " + R64[abi.reg[0]]);
+                break;
+            case Pass::SSE_REG:
+                emit("movsd " + wordAddr(i, 0) + ", %xmm" + to_string(abi.reg[0]));
+                break;
+            case Pass::AGG_REGS:
+                for (int j = 0; j < abi.neight; j++) {
+                    if (abi.cls[j] == AbiClass::SSE) emit("movsd " + wordAddr(i, j) + ", %xmm" + to_string(abi.reg[j]));
+                    else emit("movq " + wordAddr(i, j) + ", " + R64[abi.reg[j]]);
+                }
+                break;
+            default:
+                break;
+        }
     }
 
     emitCall(target);
 
-    emit("addq $" + to_string(S + 8 * n) + ", %rsp");
-    pushDepth -= n + S / 8;
+    emit("addq $" + to_string(S + 8 * W) + ", %rsp");
+    pushDepth -= W + S / 8;
+}
+
+void Gencode::genRuntimeCall(const string& fn, vector<ArgSpec>& args) {
+    vector<AbiLoc> abis(args.size());
+    for (size_t i = 0; i < args.size(); i++) {
+        abis[i].pass = Pass::INT_REG;
+        abis[i].reg[0] = static_cast<int>(i);
+        args[i].abi = &abis[i];
+    }
+    genCallWith(args, 0, fn + "@PLT");
 }
 
 void Gencode::genBuiltin(PostfixExp* call) {
@@ -967,7 +1724,19 @@ void Gencode::genBuiltin(PostfixExp* call) {
 
     PostfixExp* pf = static_cast<PostfixExp*>(call->base);
     vector<ArgSpec> args;
-    args.push_back({pf->kind == ARROW_ACCESS ? AK_THIS_PTR : AK_THIS_ADDR, pf->base, ptrType(), false});
+    ArgSpec th;
+    th.kind = (pf->kind == ARROW_ACCESS) ? AK_THIS_PTR : AK_THIS_ADDR;
+    th.exp = pf->base;
+    args.push_back(th);
+
+    auto valueArg = [&](const Type& pt) {
+        ArgSpec a;
+        a.kind = AK_VALUE;
+        a.exp = call->args[0];
+        a.info.mode = AM_VALUE;
+        a.info.ptype = pt;
+        args.push_back(a);
+    };
 
     string fn;
     switch (call->builtin) {
@@ -977,38 +1746,43 @@ void Gencode::genBuiltin(PostfixExp* call) {
         case BI_STR_C_STR: fn = "rt_str_c_str"; break;
         case BI_STR_APPEND_STR:
             fn = "rt_str_append_str";
-            args.push_back({AK_VALUE, call->args[0], Type(Type::CHAR, 1, false), false});
+            valueArg(Type(Type::CHAR, 1, false));
             break;
         case BI_STR_APPEND_CSTR:
             fn = "rt_str_append_cstr";
-            args.push_back({AK_VALUE, call->args[0], Type(Type::CHAR, 1, false), false});
+            valueArg(Type(Type::CHAR, 1, false));
             break;
         case BI_STR_APPEND_CHAR:
             fn = "rt_str_append_char";
-            args.push_back({AK_VALUE, call->args[0], Type(Type::CHAR, 0, false), false});
+            valueArg(Type(Type::CHAR, 0, false));
             break;
         default:
             throw logic_error("Gencode: builtin desconocido");
     }
-    genCallArgs(args, fn + "@PLT");
+    genRuntimeCall(fn, args);
 }
 
 // Sentencias
 
 void Gencode::visit(BlockStmt* stm) {
+    pushScope();
     for (ASTNode* item : stm->items) {
         item->accept(this);
     }
+    emitScopeCleanup(scopes.size() - 1, nullptr);
+    popScope();
 }
 
 void Gencode::visit(ExprStmt* stm) {
+    size_t mark = tempStack.size();
     if (stm->expr) stm->expr->accept(this);
+    flushTemps(mark, nullptr);
     if (pushDepth != 0) throw logic_error("Gencode: temporales sin liberar tras una sentencia");
 }
 
 void Gencode::visit(IfStmt* stm) {
     string lelse = newLabel("else");
-    genBool(stm->condition);
+    genCond(stm->condition);
     emit("testl %eax, %eax");
     emit("je " + lelse);
     stm->thenStmt->accept(this);
@@ -1027,14 +1801,12 @@ void Gencode::visit(WhileStmt* stm) {
     string lcond = newLabel("while");
     string lend = newLabel("endwhile");
     label(lcond);
-    genBool(stm->condition);
+    genCond(stm->condition);
     emit("testl %eax, %eax");
     emit("je " + lend);
-    breakLabels.push_back(lend);
-    continueLabels.push_back(lcond);
+    loops.push_back({lend, lcond, scopes.size()});
     stm->body->accept(this);
-    breakLabels.pop_back();
-    continueLabels.pop_back();
+    loops.pop_back();
     emit("jmp " + lcond);
     label(lend);
 }
@@ -1044,25 +1816,34 @@ void Gencode::visit(ForStmt* stm) {
     string lupd = newLabel("forupd");
     string lend = newLabel("endfor");
 
+    pushScope();
     if (stm->initDecl) stm->initDecl->accept(this);
-    for (Exp* e : stm->initExprs) e->accept(this);
+    for (Exp* e : stm->initExprs) {
+        size_t m = tempStack.size();
+        e->accept(this);
+        flushTemps(m, nullptr);
+    }
 
     label(lcond);
     if (stm->condition) {
-        genBool(stm->condition);
+        genCond(stm->condition);
         emit("testl %eax, %eax");
         emit("je " + lend);
     }
-    breakLabels.push_back(lend);
-    continueLabels.push_back(lupd);
+    loops.push_back({lend, lupd, scopes.size()});
     stm->body->accept(this);
-    breakLabels.pop_back();
-    continueLabels.pop_back();
+    loops.pop_back();
 
     label(lupd);
-    for (Exp* e : stm->updateExprs) e->accept(this);
+    for (Exp* e : stm->updateExprs) {
+        size_t m = tempStack.size();
+        e->accept(this);
+        flushTemps(m, nullptr);
+    }
     emit("jmp " + lcond);
     label(lend);
+    emitScopeCleanup(scopes.size() - 1, nullptr);
+    popScope();
 }
 
 void Gencode::visit(DoWhileStmt* stm) {
@@ -1070,36 +1851,66 @@ void Gencode::visit(DoWhileStmt* stm) {
     string lcond = newLabel("docond");
     string lend = newLabel("enddo");
     label(lbody);
-    breakLabels.push_back(lend);
-    continueLabels.push_back(lcond);
+    loops.push_back({lend, lcond, scopes.size()});
     stm->body->accept(this);
-    breakLabels.pop_back();
-    continueLabels.pop_back();
+    loops.pop_back();
     label(lcond);
-    genBool(stm->condition);
+    genCond(stm->condition);
     emit("testl %eax, %eax");
     emit("jne " + lbody);
     label(lend);
 }
 
 void Gencode::visit(BreakStmt* /*stm*/) {
-    emit("jmp " + breakLabels.back());
+    emitScopeCleanup(loops.back().scopeDepth, nullptr);
+    emit("jmp " + loops.back().brk);
 }
 
 void Gencode::visit(ContinueStmt* /*stm*/) {
-    emit("jmp " + continueLabels.back());
+    emitScopeCleanup(loops.back().scopeDepth, nullptr);
+    emit("jmp " + loops.back().cont);
 }
 
 void Gencode::visit(ReturnStmt* stm) {
-    if (stm->expr) {
-        Type rt = curFun->layout.returnType;
-        if (rt.isRef) {
-            genAddr(stm->expr);
-        } else {
-            Type et = stm->expr->accept(this);
-            convert(et, rt);
-        }
+    const FunctionLayout& L = curFun->layout;
+    Type rt = L.returnType;
+    size_t mark = tempStack.size();
+    Type live;
+    bool hasLive = false;
+
+    switch (L.retAbi.pass) {
+        case Pass::VOID_RET:
+            if (stm->expr) stm->expr->accept(this);
+            break;
+        case Pass::HIDDEN_PTR:
+            genObjAddr(stm->expr);
+            emit("movq %rax, %rsi");
+            emit("movq " + to_string(L.retPtrOffset) + "(%rbp), %rdi");
+            genOp(OP_COPY, rt);
+            break;
+        case Pass::AGG_REGS:
+            genObjAddr(stm->expr);
+            emit("movq %rax, %rsi");
+            emit("leaq " + to_string(L.retValOffset) + "(%rbp), %rdi");
+            genOp(OP_COPY, rt);
+            break;
+        case Pass::EMPTY:
+            genObjAddr(stm->expr);
+            break;
+        default:
+            if (rt.isRef) {
+                genAddr(stm->expr);
+                live = Type(Type::VOID, 1, false);
+            } else {
+                Type et = stm->expr->accept(this);
+                convert(et, rt);
+                live = rt;
+            }
+            hasLive = true;
+            break;
     }
+    flushTemps(mark, hasLive ? &live : nullptr);
+    emitScopeCleanup(0, hasLive ? &live : nullptr);
     emit("jmp " + endLabel);
 }
 
@@ -1119,85 +1930,147 @@ void Gencode::visit(VarDecl* decl) {
 
 void Gencode::genVarInit(VarInit* vi) {
     const VarInfo& info = vi->info;
-    if (info.storage == Storage::LOCAL) {
-        for (int so : info.stringOffsets) {
-            emit("leaq " + to_string(info.offset + so) + "(%rbp), %rdi");
-            callRuntime("rt_str_reset");
-        }
-    }
-    if (vi->initializer) {
-        genInit(info.type, vi->initializer, info, 0, true);
-    }
+    Place pl = placeOf(info);
+    size_t mark = tempStack.size();
+    genInitObject(info.type, vi->spec, pl);
+    if (vi->spec.kind == IK_REF) moveTempsToScope(mark);
+    else flushTemps(mark, nullptr);
+    if (needsDtor(info.type)) scopes.back().push_back({pl, info.type});
     if (pushDepth != 0) throw logic_error("Gencode: temporales sin liberar tras una declaracion");
-}
-
-// Inicializa el objeto de tipo t ubicado en v+extra
-void Gencode::genInit(const Type& t, Exp* init, const VarInfo& v, int extra, bool top) {
-    string mem = varMem(v, extra);
-
-    if (init->nodeKind() == NodeKind::BRACED_INIT) {
-        BracedInitList* bl = static_cast<BracedInitList*>(init);
-        if (top) {
-            emit("leaq " + mem + ", %rdi");
-            emit("xorl %eax, %eax");
-            emit("movq $" + to_string(v.size) + ", %rcx");
-            emit("rep stosb");
-        }
-        for (size_t i = 0; i < bl->elements.size(); i++) {
-            genInit(bl->elementTypes[i], bl->elements[i], v, extra + bl->elementOffsets[i], false);
-        }
-        return;
-    }
-
-    if (t.isRef) {
-        genAddr(init);
-        emit("movq %rax, " + mem);
-    } else if (t.isString()) {
-        Type vt = init->accept(this);
-        emit("movq %rax, %rsi");
-        emit("leaq " + mem + ", %rdi");
-        callRuntime(vt.isString() ? "rt_str_assign" : "rt_str_assign_cstr");
-    } else if (t.isRecord()) {
-        init->accept(this);
-        emit("movq %rax, %rdx");
-        emit("leaq " + mem + ", %rcx");
-        copyBytes("%rdx", "%rcx", records.at(t.recordName)->layout.size);
-    } else {
-        Type vt = init->accept(this);
-        convert(vt, t);
-        storeTo(t, mem);
-    }
 }
 
 void Gencode::genGlobals(VarDecl* decl) {
     for (VarInit* vi : decl->inits) {
         globals.push_back(vi->info);
-        if (!vi->initializer) continue;
-        cur = &initCode;
-        curFun = nullptr;
-        pushDepth = 0;
-        genInit(vi->info.type, vi->initializer, vi->info, 0, true);
-        if (pushDepth != 0) throw logic_error("Gencode: temporales sin liberar en un inicializador global");
-        cur = &text;
+        Place pl = placeOf(vi->info);
+        if (vi->spec.kind != IK_NONE) {
+            cur = &initCode;
+            curFun = nullptr;
+            pushDepth = 0;
+            size_t mark = tempStack.size();
+            genInitObject(vi->info.type, vi->spec, pl);
+            if (vi->spec.kind == IK_REF) moveTempsToScope(mark);
+            else flushTemps(mark, nullptr);
+            if (pushDepth != 0) throw logic_error("Gencode: temporales sin liberar en un inicializador global");
+            cur = &text;
+        }
+        if (needsDtor(vi->info.type)) globalDtors.push_back({pl, vi->info.type});
     }
 }
 
 void Gencode::visit(FunDecl* fun) {
-    genFunction(fun);
+    genFunction(fun, nullptr);
 }
 
 void Gencode::visit(RecordDecl* record) {
     for (RecordMember* m : record->members) {
-        if (m->funDecl) genFunction(m->funDecl);
+        if (m->funDecl) genFunction(m->funDecl, record);
+    }
+    for (FunDecl* f : record->implicitFuns) {
+        genFunction(f, record);
     }
 }
 
-void Gencode::genFunction(FunDecl* fun) {
+// Guarda en su slot cada parametro que llega en registros
+void Gencode::genParamSpill(FunDecl* fun) {
+    const FunctionLayout& L = fun->layout;
+    for (size_t i = 0; i < L.params.size(); i++) {
+        const VarInfo& p = L.params[i];
+        const AbiLoc& a = L.paramAbi[i];
+        string slot = to_string(p.offset) + "(%rbp)";
+        switch (a.pass) {
+            case Pass::INT_REG: {
+                int sz = accessSize(p.type);
+                if (sz == 8) emit(string("movq ") + R64[a.reg[0]] + ", " + slot);
+                else if (sz == 4) emit(string("movl ") + R32[a.reg[0]] + ", " + slot);
+                else emit(string("movb ") + R8[a.reg[0]] + ", " + slot);
+                break;
+            }
+            case Pass::SSE_REG:
+                emit(string(p.type.kind == Type::FLOAT ? "movss" : "movsd") + " %xmm" + to_string(a.reg[0]) + ", " + slot);
+                break;
+            case Pass::AGG_REGS:
+                for (int k = 0; k < a.neight; k++) {
+                    int nb = a.size - 8 * k;
+                    if (nb > 8) nb = 8;
+                    if (a.cls[k] == AbiClass::SSE) {
+                        emit(string(nb == 4 ? "movss" : "movsd") + " %xmm" + to_string(a.reg[k]) + ", " +
+                             to_string(p.offset + 8 * k) + "(%rbp)");
+                    } else {
+                        storePartial(R64[a.reg[k]], "%rbp", p.offset + 8 * k, nb);
+                    }
+                }
+                break;
+            case Pass::INVISIBLE_REF:
+                if (a.reg[0] >= 0) {
+                    emit(string("movq ") + R64[a.reg[0]] + ", " + slot);
+                } else {
+                    emit("movq " + to_string(16 + a.stackOffset) + "(%rbp), %r10");
+                    emit("movq %r10, " + slot);
+                }
+                break;
+            default:
+                break;
+        }
+    }
+}
+
+// Inicializa los campos de this en orden de declaracion antes del cuerpo del constructor
+void Gencode::genFieldInits(FunDecl* fun, RecordDecl* owner) {
+    const RecordLayout& L = owner->layout;
+    for (const FieldInit& fi : fun->fieldInits) {
+        const FieldInfo& f = L.fields[fi.fieldIndex];
+        Place dst = thisPlace(f.offset);
+        size_t mark = tempStack.size();
+        if (fi.spec.kind == IK_COPY && !fi.spec.expr) {
+            Place src;
+            src.kind = Place::SLOT_PTR;
+            src.off = fun->layout.params[1].offset;
+            src.extra = f.offset;
+            loadAddr(src, "%rsi");
+            loadAddr(dst, "%rdi");
+            genOp(OP_COPY, f.type);
+        } else {
+            genInitObject(f.type, fi.spec, dst);
+        }
+        if (fi.spec.kind == IK_REF) moveTempsToScope(mark);
+        else flushTemps(mark, nullptr);
+    }
+}
+
+void Gencode::genImplicitAssign(FunDecl* fun, RecordDecl* owner) {
+    const RecordLayout& L = owner->layout;
+    for (const FieldInfo& f : L.fields) {
+        Place src;
+        src.kind = Place::SLOT_PTR;
+        src.off = fun->layout.params[1].offset;
+        src.extra = f.offset;
+        loadAddr(src, "%rsi");
+        loadAddr(thisPlace(f.offset), "%rdi");
+        genOp(OP_ASSIGN, f.type);
+    }
+    emit("movq " + to_string(thisOffset()) + "(%rbp), %rax");
+}
+
+void Gencode::genFieldDtors(RecordDecl* owner) {
+    const RecordLayout& L = owner->layout;
+    for (size_t i = L.fields.size(); i > 0; i--) {
+        const FieldInfo& f = L.fields[i - 1];
+        if (!needsDtor(f.type)) continue;
+        loadAddr(thisPlace(f.offset), "%rdi");
+        genOp(OP_DESTROY, f.type);
+    }
+}
+
+void Gencode::genFunction(FunDecl* fun, RecordDecl* owner) {
     const FunctionLayout& L = fun->layout;
     curFun = fun;
     cur = &text;
     pushDepth = 0;
     endLabel = newLabel("ret");
+    scopes.clear();
+    tempStack.clear();
+    loops.clear();
     bool isMain = (L.label == "main");
 
     if (isMain) *cur << "\t.globl main\n";
@@ -1207,75 +2080,49 @@ void Gencode::genFunction(FunDecl* fun) {
     emit("movq %rsp, %rbp");
     emit("subq $" + to_string(L.frameSize) + ", %rsp");
 
-    // Spill de todos los parametros a sus slots; los de pila viven sobre el retorno
-    int ni = 0, nf = 0, stackOff = 16;
-    for (const VarInfo& p : L.params) {
-        Cls c = cls(p.type);
-        bool flt = !p.type.isRef && (c == C_FLOAT || c == C_DOUBLE);
-        string slot = to_string(p.offset) + "(%rbp)";
-        int sz = accessSize(p.type);
-        if (flt) {
-            if (nf < 8) {
-                emit(string(c == C_FLOAT ? "movss" : "movsd") + " %xmm" + to_string(nf) + ", " + slot);
-                nf++;
-            } else {
-                if (sz == 4) {
-                    emit("movl " + to_string(stackOff) + "(%rbp), %r10d");
-                    emit("movl %r10d, " + slot);
-                } else {
-                    emit("movq " + to_string(stackOff) + "(%rbp), %r10");
-                    emit("movq %r10, " + slot);
-                }
-                stackOff += 8;
-            }
-        } else {
-            if (ni < 6) {
-                if (sz == 8) emit(string("movq ") + R64[ni] + ", " + slot);
-                else if (sz == 4) emit(string("movl ") + R32[ni] + ", " + slot);
-                else emit(string("movb ") + R8[ni] + ", " + slot);
-                ni++;
-            } else {
-                string src = to_string(stackOff) + "(%rbp)";
-                if (sz == 8) {
-                    emit("movq " + src + ", %r10");
-                    emit("movq %r10, " + slot);
-                } else if (sz == 4) {
-                    emit("movl " + src + ", %r10d");
-                    emit("movl %r10d, " + slot);
-                } else {
-                    emit("movb " + src + ", %r10b");
-                    emit("movb %r10b, " + slot);
-                }
-                stackOff += 8;
-            }
-        }
+    if (L.retAbi.pass == Pass::HIDDEN_PTR) {
+        emit("movq %rdi, " + to_string(L.retPtrOffset) + "(%rbp)");
     }
-
-    for (int so : L.stringSlots) {
-        emit("movq $0, " + to_string(so) + "(%rbp)");
-        emit("movq $0, " + to_string(so + 8) + "(%rbp)");
-    }
+    genParamSpill(fun);
 
     if (isMain) emit("call __init_globals");
+
+    pushScope();
+    if (fun->funKind == FunKind::CTOR && owner) genFieldInits(fun, owner);
+    if (fun->funKind == FunKind::COPY_ASSIGN && fun->isImplicit && owner) genImplicitAssign(fun, owner);
 
     if (fun->body) {
         for (ASTNode* item : fun->body->items) {
             item->accept(this);
         }
     }
+    emitScopeCleanup(0, nullptr);
+    popScope();
 
     if (isMain) emit("movl $0, %eax");
 
     label(endLabel);
-    if (!L.stringSlots.empty()) {
-        emit("movq %rax, " + to_string(L.retSaveOffset) + "(%rbp)");
-        emit("movsd %xmm0, " + to_string(L.retSaveOffset + 8) + "(%rbp)");
-        for (int so : L.stringSlots) {
-            emit("leaq " + to_string(so) + "(%rbp), %rdi");
-            callRuntime("rt_str_free");
-        }
-        emit("movq " + to_string(L.retSaveOffset) + "(%rbp), %rax");
-        emit("movsd " + to_string(L.retSaveOffset + 8) + "(%rbp), %xmm0");
+    if (fun->funKind == FunKind::DTOR && owner) genFieldDtors(owner);
+    if (isMain) {
+        emit("pushq %rax");
+        pushDepth++;
+        emitCall("__fini_globals");
+        emit("popq %rax");
+        pushDepth--;
+    }
+    switch (L.retAbi.pass) {
+        case Pass::HIDDEN_PTR:
+            emit("movq " + to_string(L.retPtrOffset) + "(%rbp), %rax");
+            break;
+        case Pass::AGG_REGS:
+            for (int k = 0; k < L.retAbi.neight; k++) {
+                string mem = to_string(L.retValOffset + 8 * k) + "(%rbp)";
+                if (L.retAbi.cls[k] == AbiClass::SSE) emit("movsd " + mem + ", %xmm" + to_string(L.retAbi.reg[k]));
+                else emit("movq " + mem + ", " + (L.retAbi.reg[k] == 0 ? "%rax" : "%rdx"));
+            }
+            break;
+        default:
+            break;
     }
     emit("leave");
     emit("ret");
@@ -1284,6 +2131,7 @@ void Gencode::genFunction(FunDecl* fun) {
 }
 
 void Gencode::visit(Program* prog) {
+    program = prog;
     *cur << "\t.text\n";
 
     for (ASTNode* decl : prog->declarations) {
@@ -1294,12 +2142,24 @@ void Gencode::visit(Program* prog) {
         }
     }
 
+    cur = &text;
+    pushDepth = 0;
     *cur << "\t.type __init_globals, @function\n";
     label("__init_globals");
     emit("pushq %rbp");
     emit("movq %rsp, %rbp");
+    emit("subq $" + to_string(prog->initFrameSize) + ", %rsp");
     *cur << initCode.str();
-    emit("popq %rbp");
+    emit("leave");
+    emit("ret");
+
+    *cur << "\t.type __fini_globals, @function\n";
+    label("__fini_globals");
+    emit("pushq %rbp");
+    emit("movq %rsp, %rbp");
+    scopes.clear();
+    emitCleanupItems(globalDtors);
+    emit("leave");
     emit("ret");
 
     for (const VarInfo& g : globals) {

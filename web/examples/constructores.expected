@@ -1,0 +1,9 @@
+Punto(3, 4)
+suma = 7
+Contador() cuenta=0 paso=1
+Contador(5) cuenta=0 paso=5
+1 10
+Punto(1, 2)
+Punto(10, 20)
+Segmento listo
+dx = 9

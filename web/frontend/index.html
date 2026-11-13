@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="Compilador de un subconjunto de C++ a ensamblador x86-64 con diagnóstico por fase, layout, ABI y optimizaciones.">
+<title>Mini compilador C++ a x86-64</title>
+<script src="js/theme-init.js"></script>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%233b5bdb'/%3E%3C/svg%3E">
+<link rel="preload" href="vendor/fonts/inter-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="vendor/fonts/jbmono-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="vendor/codemirror.css">
+<link rel="stylesheet" href="vendor/dialog.css">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<svg class="sprite" width="0" height="0" aria-hidden="true" focusable="false">
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5z"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2.5"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><path d="M4 7h9M19 7h1M4 17h1M11 17h9M4 12h3M13 12h7"/><circle cx="16" cy="7" r="2.2"/><circle cx="8" cy="17" r="2.2"/><circle cx="10" cy="12" r="2.2"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15V7a2 2 0 012-2h8"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11m0 0l-4-4m4 4l4-4M5 20h14"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 002 2h6a2 2 0 002-2l1-12M9 7V4h6v3"/></symbol>
+  <symbol id="i-undo" viewBox="0 0 24 24"><path d="M4 12a8 8 0 108-8 8 8 0 00-6 2.7L4 9M4 4v5h5"/></symbol>
+  <symbol id="i-format" viewBox="0 0 24 24"><path d="M4 6h16M4 12h10M4 18h14"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 4l9.5 16.5h-19z"/><path d="M12 10v4M12 17.4v.2"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5M12 16v.2"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8v.2"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 019.5 4 8 8 0 1020 14.5z"/></symbol>
+  <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2.5"/><path d="M8 20h8M12 16v4"/></symbol>
+  <symbol id="i-car" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2.5"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/><circle cx="10" cy="12" r="1"/><circle cx="14" cy="12" r="1"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
+  <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9.5l3 2.5-3 2.5M13 15h4"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7.5A2.5 2.5 0 005 5.5v13A2.5 2.5 0 007.5 21h9a2.5 2.5 0 002.5-2.5V8z"/><path d="M14 3v5h5M10 13l-2 2 2 2M14 13l2 2-2 2"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14L20 4M14 4h6v6M20 14v5a1 1 0 01-1 1H5a1 1 0 01-1-1V5a1 1 0 011-1h5"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><path d="M13 3L5 13.5h6L10 21l8-10.5h-6z"/></symbol>
+  <symbol id="i-scan" viewBox="0 0 24 24"><path d="M4 8V6a2 2 0 012-2h2M16 4h2a2 2 0 012 2v2M20 16v2a2 2 0 01-2 2h-2M8 20H6a2 2 0 01-2-2v-2M8 12h8"/></symbol>
+  <symbol id="i-tree" viewBox="0 0 24 24"><circle cx="6" cy="5.5" r="2"/><circle cx="18" cy="12" r="2"/><circle cx="6" cy="18.5" r="2"/><path d="M6 7.5v9M6 12h10"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 4.5-3.4 7.8-8 9-4.6-1.2-8-4.5-8-9V6z"/><path d="M9 12l2 2 4-4"/></symbol>
+  <symbol id="i-boxes" viewBox="0 0 24 24"><rect x="3" y="3.5" width="8" height="8" rx="1.8"/><rect x="13" y="3.5" width="8" height="8" rx="1.8"/><rect x="3" y="13.5" width="18" height="7" rx="1.8"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2"/><path d="M10 3v3M14 3v3M10 18v3M14 18v3M3 10h3M3 14h3M18 10h3M18 14h3"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/></symbol>
+  <symbol id="i-run" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M10 8.5l5 3.5-5 3.5z"/></symbol>
+  <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M18.5 16.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 12.5l9 5 9-5"/></symbol>
+  <symbol id="i-code" viewBox="0 0 24 24"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5M13.5 5l-3 14"/></symbol>
+  <symbol id="i-branch" viewBox="0 0 24 24"><circle cx="6" cy="5.5" r="2"/><circle cx="6" cy="18.5" r="2"/><circle cx="18" cy="8.5" r="2"/><path d="M6 7.5v9M18 10.5c0 4-12 2-12 6"/></symbol>
+  <symbol id="i-bulb" viewBox="0 0 24 24"><path d="M9 18h6M10 21h4M12 3a6 6 0 00-3.5 10.9c.6.5 1 1.2 1 2V16h5v-.1c0-.8.4-1.5 1-2A6 6 0 0012 3z"/></symbol>
+  <symbol id="i-pen" viewBox="0 0 24 24"><path d="M4 20l1-4L16.5 4.5a2.1 2.1 0 013 3L8 19z"/><path d="M14.5 6.5l3 3"/></symbol>
+  <symbol id="i-spinner" viewBox="0 0 24 24"><path d="M12 3.5a8.5 8.5 0 11-8.5 8.5"/></symbol>
+</svg>
+
+<a class="skip-link" href="#editor-region">Saltar al editor</a>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="brand-mark" viewBox="0 0 40 40" width="38" height="38" role="img" aria-label="Logotipo del compilador">
+      <defs><linearGradient id="logo-g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5c7cfa"/><stop offset="1" stop-color="#2f49b8"/></linearGradient></defs>
+      <rect x="1" y="1" width="38" height="38" rx="11" fill="url(#logo-g)"/>
+      <path d="M16 13l-7 7 7 7M24 13l7 7-7 7" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="31" cy="9" r="3" fill="#f97316"/>
+    </svg>
+    <div class="brand-text">
+      <h1>Mini compilador</h1>
+      <p>C++ a ensamblador <span class="mono">x86-64</span> AT&amp;T</p>
+    </div>
+  </div>
+
+  <div class="top-controls">
+    <div class="popover-host">
+      <button type="button" id="btn-examples" class="ex-trigger" aria-haspopup="dialog" aria-expanded="false" aria-controls="examples-pop">
+        <svg class="i" aria-hidden="true"><use href="#i-layers"/></svg>
+        <span class="ex-label">Ejemplos</span>
+        <span class="ex-current" id="ex-current">Elegir…</span>
+        <svg class="i" aria-hidden="true"><use href="#i-chevron"/></svg>
+      </button>
+      <div class="popover ex-pop" id="examples-pop" role="dialog" aria-label="Galería de ejemplos">
+        <div class="ex-search"><svg class="i" aria-hidden="true"><use href="#i-search"/></svg>
+          <input id="ex-search" type="search" placeholder="Buscar ejemplo o etiqueta (ctor, const, ABI, opt)" aria-label="Buscar ejemplos" autocomplete="off"></div>
+        <div class="ex-grid" id="ex-grid"></div>
+      </div>
+    </div>
+    <select id="example-select" hidden aria-hidden="true" tabindex="-1"><option value="">Seleccionar…</option></select>
+
+    <button type="button" id="btn-palette" class="palette-trigger" aria-haspopup="dialog" aria-label="Abrir la paleta de comandos">
+      <svg class="i" aria-hidden="true"><use href="#i-search"/></svg><span>Buscar o ejecutar…</span><kbd class="kbd" id="pal-kbd">Ctrl&#8201;K</kbd>
+    </button>
+
+    <div class="seg seg-theme" id="theme-seg" role="radiogroup" aria-label="Tema de la interfaz">
+      <span class="seg-ind" aria-hidden="true"></span>
+      <label class="seg-opt" data-tip="Automático"><input type="radio" name="theme" value="auto" aria-label="Tema automático"><svg class="i" aria-hidden="true"><use href="#i-monitor"/></svg></label>
+      <label class="seg-opt" data-tip="Claro"><input type="radio" name="theme" value="light" aria-label="Tema claro"><svg class="i" aria-hidden="true"><use href="#i-sun"/></svg></label>
+      <label class="seg-opt" data-tip="Oscuro"><input type="radio" name="theme" value="dark" aria-label="Tema oscuro"><svg class="i" aria-hidden="true"><use href="#i-moon"/></svg></label>
+    </div>
+
+    <button type="button" id="btn-mascot" class="ibtn mascot-toggle" aria-pressed="true" aria-label="Mostrar u ocultar la mascota" data-tip="Mascota">
+      <svg class="i" aria-hidden="true"><use href="#i-car"/></svg>
+    </button>
+  </div>
+
+  <div class="mascot-dock" id="mascot-dock">
+    <div class="mascot" id="mascot"></div>
+  </div>
+</header>
+
+<div class="toolbar" role="toolbar" aria-label="Acciones">
+  <button type="button" id="btn-run" class="btn-run" title="Compilar y ejecutar (Ctrl/Cmd+Enter)">
+    <span class="btn-run-glow" aria-hidden="true"></span>
+    <svg class="i i-play" aria-hidden="true"><use href="#i-play"/></svg>
+    <svg class="i i-spin" aria-hidden="true"><use href="#i-spinner"/></svg>
+    <span class="btn-run-label">Compilar y ejecutar</span>
+    <kbd class="kbd" id="run-kbd">Ctrl&#8201;&#8629;</kbd>
+  </button>
+  <button type="button" id="btn-compile" class="btn" title="Compilar sin ejecutar">Solo compilar</button>
+  <button type="button" id="btn-cancel" class="btn danger" disabled>
+    <svg class="i" aria-hidden="true"><use href="#i-stop"/></svg>Cancelar
+  </button>
+
+  <span class="sep" aria-hidden="true"></span>
+
+  <div class="opt-group">
+    <span class="opt-title" id="opt-title">Optimización</span>
+    <div class="seg seg-opt" id="opt-seg" role="radiogroup" aria-labelledby="opt-title">
+      <span class="seg-ind" aria-hidden="true"></span>
+      <label class="seg-opt"><input type="radio" name="opt" value="0" checked><span class="mono">-O0</span></label>
+      <label class="seg-opt"><input type="radio" name="opt" value="1"><span class="mono">-O1</span></label>
+    </div>
+  </div>
+
+  <div class="opt-group" role="group" aria-label="Pases de optimización">
+    <label class="switch" data-tip="fold: plegado de constantes"><input type="checkbox" class="pass" value="fold" checked disabled><span class="sw-track"><span class="sw-thumb"></span></span><span class="sw-label">fold</span></label>
+    <label class="switch" data-tip="inline: expansión en línea de funciones puras"><input type="checkbox" class="pass" value="inline" checked disabled><span class="sw-track"><span class="sw-thumb"></span></span><span class="sw-label">inline</span></label>
+    <label class="switch" data-tip="sethi: orden de evaluación Sethi-Ullman"><input type="checkbox" class="pass" value="sethi" checked disabled><span class="sw-track"><span class="sw-thumb"></span></span><span class="sw-label">sethi</span></label>
+  </div>
+
+  <div class="popover-host">
+    <button type="button" id="btn-options" class="btn ghost" aria-expanded="false" aria-controls="options-pop" aria-haspopup="dialog">
+      <svg class="i" aria-hidden="true"><use href="#i-gear"/></svg>Opciones
+    </button>
+    <div class="popover" id="options-pop" role="dialog" aria-label="Opciones de salida y ejecución">
+      <div class="pop-field">
+        <span id="mode-label">Modo de salida</span>
+        <div class="mode-grid" role="radiogroup" aria-labelledby="mode-label" id="mode-grid">
+          <button type="button" class="mode-chip" role="radio" aria-checked="true" data-mode="all">all</button>
+          <button type="button" class="mode-chip" role="radio" aria-checked="false" data-mode="run">run</button>
+          <button type="button" class="mode-chip" role="radio" aria-checked="false" data-mode="asm">asm</button>
+          <button type="button" class="mode-chip" role="radio" aria-checked="false" data-mode="check">check</button>
+          <button type="button" class="mode-chip" role="radio" aria-checked="false" data-mode="ast">ast</button>
+          <button type="button" class="mode-chip" role="radio" aria-checked="false" data-mode="scan">scan</button>
+        </div>
+        <select id="mode-select" hidden aria-hidden="true" tabindex="-1">
+          <option value="all">Completo (all)</option>
+          <option value="run">Ejecutar (run)</option>
+          <option value="asm">Ensamblado (asm)</option>
+          <option value="check">Verificar (check)</option>
+          <option value="ast">AST (ast)</option>
+          <option value="scan">Tokens (scan)</option>
+        </select>
+      </div>
+      <div class="pop-field">
+        <span id="timeout-label">Tiempo límite de ejecución</span>
+        <div class="stepper" role="group" aria-labelledby="timeout-label">
+          <button type="button" id="timeout-dec" aria-label="Reducir un segundo">&#8722;</button>
+          <input id="timeout-input" type="number" min="1" max="10" step="1" value="5" aria-label="Tiempo límite de ejecución en segundos">
+          <span class="unit">s</span>
+          <button type="button" id="timeout-inc" aria-label="Aumentar un segundo">+</button>
+        </div>
+        <span class="pop-hint">Entre 1 y 10 segundos. Si el programa lo supera se detiene.</span>
+      </div>
+    </div>
+  </div>
+
+  <span class="spacer"></span>
+  <span class="mini-pipe" id="mini-pipe" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>
+  <span id="run-status" class="run-status" role="status" aria-live="polite"></span>
+</div>
+
+<div class="shell">
+  <nav class="rail" id="rail" aria-label="Vistas">
+    <span class="rail-ind" id="rail-ind" aria-hidden="true"></span>
+    <button type="button" class="rail-btn" data-view="editor" aria-label="Ir al editor" data-tip="Editor (Alt+1)"><svg class="i" aria-hidden="true"><use href="#i-code"/></svg></button>
+    <button type="button" class="rail-btn" data-view="output" aria-label="Salida" data-tip="Salida (Alt+2)"><svg class="i" aria-hidden="true"><use href="#i-terminal"/></svg></button>
+    <button type="button" class="rail-btn" data-view="diag" aria-label="Diagnóstico" data-tip="Diagnóstico (Alt+3)"><svg class="i" aria-hidden="true"><use href="#i-shield"/></svg><span class="rail-badge" id="rail-badge" hidden></span></button>
+    <button type="button" class="rail-btn" data-view="tokens" aria-label="Tokens" data-tip="Tokens (Alt+4)"><svg class="i" aria-hidden="true"><use href="#i-scan"/></svg></button>
+    <button type="button" class="rail-btn" data-view="ast" aria-label="AST" data-tip="AST (Alt+5)"><svg class="i" aria-hidden="true"><use href="#i-tree"/></svg></button>
+    <button type="button" class="rail-btn" data-view="layout" aria-label="Layout y ABI" data-tip="Layout y ABI (Alt+6)"><svg class="i" aria-hidden="true"><use href="#i-boxes"/></svg></button>
+    <button type="button" class="rail-btn" data-view="asm" aria-label="Assembly" data-tip="Assembly (Alt+7)"><svg class="i" aria-hidden="true"><use href="#i-cpu"/></svg></button>
+    <button type="button" class="rail-btn" data-view="opt" aria-label="Optimizaciones" data-tip="Optimizaciones (Alt+8)"><svg class="i" aria-hidden="true"><use href="#i-zap"/></svg></button>
+    <span class="rail-sep"></span>
+    <button type="button" class="rail-btn" data-view="palette" aria-label="Paleta de comandos" data-tip="Paleta (Ctrl+K)"><svg class="i" aria-hidden="true"><use href="#i-search"/></svg></button>
+  </nav>
+
+  <main class="workspace" id="workspace">
+    <section class="pane pane-left" id="pane-left" aria-label="Entrada">
+      <div class="editor-region" id="editor-region" tabindex="-1">
+        <div class="pane-head">
+          <div class="file-chip"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg><h2>programa.cpp</h2></div>
+          <span class="spacer"></span>
+          <div class="head-tools" role="group" aria-label="Acciones del editor">
+            <button type="button" id="btn-format" class="ibtn" aria-label="Formatear código" data-tip="Formatear"><svg class="i" aria-hidden="true"><use href="#i-format"/></svg></button>
+            <button type="button" id="btn-reset" class="ibtn" aria-label="Restablecer al ejemplo inicial" data-tip="Restablecer"><svg class="i" aria-hidden="true"><use href="#i-undo"/></svg></button>
+            <button type="button" id="btn-clear" class="ibtn" aria-label="Vaciar el editor" data-tip="Limpiar"><svg class="i" aria-hidden="true"><use href="#i-trash"/></svg></button>
+            <span class="sep" aria-hidden="true"></span>
+            <button type="button" id="btn-copy" class="ibtn" aria-label="Copiar el código fuente" data-tip="Copiar"><svg class="i" aria-hidden="true"><use href="#i-copy"/></svg></button>
+            <button type="button" id="btn-download" class="ibtn" aria-label="Descargar el código como .cpp" data-tip="Descargar"><svg class="i" aria-hidden="true"><use href="#i-download"/></svg></button>
+          </div>
+        </div>
+        <div class="editor-host"><textarea id="code" aria-label="Código fuente C++"></textarea></div>
+      </div>
+      <div class="splitter splitter-h" id="split-stdin" role="separator" aria-orientation="horizontal"
+           aria-label="Redimensionar entrada estándar" tabindex="0"></div>
+      <div class="stdin-region" id="stdin-region">
+        <div class="pane-head"><div class="file-chip"><svg class="i" aria-hidden="true"><use href="#i-terminal"/></svg><h2><label for="stdin">Entrada estándar (stdin)</label></h2></div></div>
+        <textarea id="stdin" class="stdin" spellcheck="false" placeholder="Texto que leerá cin"></textarea>
+      </div>
+    </section>
+
+    <div class="splitter splitter-v" id="split-main" role="separator" aria-orientation="vertical"
+         aria-label="Redimensionar paneles" tabindex="0"></div>
+
+    <section class="pane pane-right" id="pane-right" aria-label="Resultados">
+      <div class="tabs" role="tablist" aria-label="Resultados de la compilación" id="tablist">
+        <button type="button" role="tab" id="tab-output" aria-controls="panel-output" aria-selected="true" data-tab="output">Salida</button>
+        <button type="button" role="tab" id="tab-diag" aria-controls="panel-diag" aria-selected="false" tabindex="-1" data-tab="diag">Diagnóstico <span class="badge" id="badge-diag" hidden></span></button>
+        <button type="button" role="tab" id="tab-tokens" aria-controls="panel-tokens" aria-selected="false" tabindex="-1" data-tab="tokens">Tokens</button>
+        <button type="button" role="tab" id="tab-ast" aria-controls="panel-ast" aria-selected="false" tabindex="-1" data-tab="ast">AST</button>
+        <button type="button" role="tab" id="tab-typed" aria-controls="panel-typed" aria-selected="false" tabindex="-1" data-tab="typed">AST con tipos</button>
+        <button type="button" role="tab" id="tab-layout" aria-controls="panel-layout" aria-selected="false" tabindex="-1" data-tab="layout">Layout y ABI</button>
+        <button type="button" role="tab" id="tab-asm" aria-controls="panel-asm" aria-selected="false" tabindex="-1" data-tab="asm">Assembly</button>
+        <button type="button" role="tab" id="tab-opt" aria-controls="panel-opt" aria-selected="false" tabindex="-1" data-tab="opt">Optimizaciones</button>
+        <span class="tab-ind" id="tab-ind" aria-hidden="true"></span>
+      </div>
+
+      <div class="panels" id="panels">
+        <div role="tabpanel" id="panel-output" aria-labelledby="tab-output" class="panel" tabindex="0"></div>
+        <div role="tabpanel" id="panel-diag" aria-labelledby="tab-diag" class="panel" tabindex="0" hidden></div>
+        <div role="tabpanel" id="panel-tokens" aria-labelledby="tab-tokens" class="panel" tabindex="0" hidden></div>
+        <div role="tabpanel" id="panel-ast" aria-labelledby="tab-ast" class="panel" tabindex="0" hidden></div>
+        <div role="tabpanel" id="panel-typed" aria-labelledby="tab-typed" class="panel" tabindex="0" hidden></div>
+        <div role="tabpanel" id="panel-layout" aria-labelledby="tab-layout" class="panel" tabindex="0" hidden></div>
+        <div role="tabpanel" id="panel-asm" aria-labelledby="tab-asm" class="panel" tabindex="0" hidden></div>
+        <div role="tabpanel" id="panel-opt" aria-labelledby="tab-opt" class="panel" tabindex="0" hidden></div>
+        <div class="skeleton" id="skeleton" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<footer class="statusbar" aria-label="Barra de estado">
+  <span class="sb-item" id="sb-server"><i class="sb-dot" id="sb-dot"></i><span id="sb-server-text">Conectando…</span></span>
+  <span class="sb-item sb-branch" title="Nivel de optimización"><svg class="i" aria-hidden="true"><use href="#i-branch"/></svg><span id="sb-opt" class="mono">-O0</span></span>
+  <span class="sb-item" id="sb-phase">Sin compilar</span>
+  <button type="button" class="sb-item sb-btn" id="sb-diag" aria-label="Ver diagnóstico: 0 errores, 0 advertencias">
+    <svg class="i sb-err" aria-hidden="true"><use href="#i-alert"/></svg><span id="sb-errs" class="sb-err">0</span>
+    <svg class="i sb-warn" aria-hidden="true"><use href="#i-warn"/></svg><span id="sb-warns" class="sb-warn">0</span>
+  </button>
+  <span class="spacer"></span>
+  <span id="cursor-pos" class="sb-item mono" aria-live="off">Ln 1, Col 1</span>
+  <span class="sb-item sb-info mono" id="foot-info"></span>
+  <a class="foot-link" href="LICENCIAS.txt" target="_blank" rel="noopener">Código fuente y licencias</a>
+</footer>
+
+<div class="palette" id="palette" hidden>
+  <div class="palette-backdrop" id="pal-backdrop"></div>
+  <div class="palette-box" role="dialog" aria-modal="true" aria-label="Paleta de comandos">
+    <div class="pal-input">
+      <svg class="i" aria-hidden="true"><use href="#i-search"/></svg>
+      <input id="pal-input" type="text" role="combobox" aria-expanded="true" aria-controls="pal-list" aria-autocomplete="list" aria-activedescendant="" placeholder="Escribe un comando: compilar, tema, ejemplo, AST…" autocomplete="off" spellcheck="false" aria-label="Buscar comandos">
+      <kbd class="kbd">Esc</kbd>
+    </div>
+    <ul class="pal-list" id="pal-list" role="listbox" aria-label="Comandos"></ul>
+    <div class="pal-foot"><span><kbd class="kbd">&#8593;&#8595;</kbd>navegar</span><span><kbd class="kbd">&#8629;</kbd>ejecutar</span><span><kbd class="kbd">Esc</kbd>cerrar</span></div>
+  </div>
+</div>
+
+<div id="toast" class="toast-region" role="status" aria-live="polite"></div>
+
+<script src="vendor/codemirror.js"></script>
+<script src="vendor/clike.js"></script>
+<script src="vendor/searchcursor.js"></script>
+<script src="vendor/dialog.js"></script>
+<script src="vendor/search.js"></script>
+<script src="vendor/jump-to-line.js"></script>
+<script src="vendor/matchbrackets.js"></script>
+<script src="vendor/closebrackets.js"></script>
+<script src="vendor/active-line.js"></script>
+<script src="vendor/comment.js"></script>
+<script src="vendor/mascota.js"></script>
+<script src="js/lib.js"></script>
+<script src="js/mascot.js"></script>
+<script src="js/app.js"></script>
+<script src="js/ui.js"></script>
+</body>
+</html>

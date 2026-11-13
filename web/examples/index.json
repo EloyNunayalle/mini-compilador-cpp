@@ -1,0 +1,15 @@
+[
+  {"id": "hola_mundo", "titulo": "Hola mundo", "descripcion": "Salida con cout y operaciones basicas del tipo string."},
+  {"id": "aritmetica_control", "titulo": "Aritmetica y control de flujo", "descripcion": "Funciones, bucles while y for, condicionales, division entera y real."},
+  {"id": "punteros_arreglos", "titulo": "Punteros y arreglos", "descripcion": "Acceso por indice y por aritmetica de punteros, paso de punteros a funciones."},
+  {"id": "structs_metodos", "titulo": "Structs y metodos", "descripcion": "Registros con campos y metodos que modifican el estado."},
+  {"id": "constructores", "titulo": "Constructores", "descripcion": "Listas de inicializacion, inicializadores de miembros y miembros que son objetos."},
+  {"id": "ciclo_vida", "titulo": "Copia, asignacion y destructor", "descripcion": "Trazas de constructor, constructor de copia, operator= y destructor sin elision de copias."},
+  {"id": "string_en_record", "titulo": "String dentro de records", "descripcion": "Copia profunda de campos string al copiar structs y clases."},
+  {"id": "const_correctitud", "titulo": "Const", "descripcion": "Variables const, const T&, const T*, T* const y metodos const."},
+  {"id": "records_por_valor", "titulo": "Records por valor", "descripcion": "Paso y retorno de records pequenos, grandes y con string; convenciones de llamada."},
+  {"id": "memoria_dinamica", "titulo": "new y delete", "descripcion": "Objetos y arreglos en el heap con new, new[], delete y delete[]."},
+  {"id": "lectura_cin", "titulo": "Lectura con cin", "descripcion": "Lee enteros y una palabra de la entrada estandar.", "stdin": "5\n12 7 30 4 19\nMarco\n"},
+  {"id": "optimizacion", "titulo": "Optimizaciones", "descripcion": "Constantes plegables y una funcion pura inlinable; compare -O0 con -O1."},
+  {"id": "error_de_tipo", "titulo": "Error de tipo (diagnostico)", "descripcion": "Programa con errores semanticos intencionales para ver el panel de diagnostico."}
+]

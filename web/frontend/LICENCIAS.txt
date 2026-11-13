@@ -1,0 +1,34 @@
+Codigo fuente y licencias
+=========================
+
+Mini compilador C++ a x86-64 (interfaz web)
+
+El codigo fuente completo de este proyecto (compilador, runtime, servidor y
+esta interfaz web) esta disponible en el repositorio del proyecto, en las
+carpetas de la raiz, web/frontend y web/backend. Quien use el servicio por red
+puede obtener ese codigo desde alli.
+
+Componentes de terceros incluidos en web/frontend/vendor:
+
+Mascota Compi (vendor/mascota.js)
+  Personaje propio (web/mascota/compi.avatar.json) creado con bible-strong-avatar-lab, licencia AGPL-3.0.
+  Copyright Stephane Montlouis-Calixte.
+  https://github.com/smontlouis/bible-strong-avatar-lab
+  Se empaqueto con esbuild a partir de @bible-strong/avatar-web y
+  @bible-strong/avatar-core (AGPL-3.0-only). La libreria no se modifico salvo sustituir
+  el validador ajv del esquema del avatar por una funcion vacia, para que la
+  politica de seguridad del sitio no necesite unsafe-eval. Al ofrecerse por red,
+  el codigo de este proyecto que la incluye se publica segun los terminos de la
+  AGPL-3.0.
+
+CodeMirror 5 (vendor/codemirror*.js, addons y CSS)
+  Licencia MIT. Copyright Marijn Haverbeke y otros.
+  Ver vendor/codemirror.LICENSE.
+
+Inter (vendor/fonts/inter-latin.woff2)
+  SIL Open Font License 1.1. Copyright The Inter Project Authors.
+  Ver vendor/fonts/OFL-Inter.txt.
+
+JetBrains Mono (vendor/fonts/jbmono-latin.woff2)
+  SIL Open Font License 1.1. Copyright The JetBrains Mono Project Authors.
+  Ver vendor/fonts/OFL-JetBrainsMono.txt.

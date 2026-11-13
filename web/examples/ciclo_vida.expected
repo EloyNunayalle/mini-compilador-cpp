@@ -1,0 +1,17 @@
+ctor 1
+copia de 1 -> 101
+ctor 2
+asignacion 1 a 2
+copia de 1 -> 101
+dentro de por_valor con 101
+dtor 101
+ctor 7
+copia de 7 -> 107
+dtor 7
+copia de 107 -> 207
+dtor 107
+fin de main
+dtor 207
+dtor 1
+dtor 101
+dtor 1

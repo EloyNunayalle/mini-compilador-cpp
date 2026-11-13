@@ -1,0 +1,11 @@
+crea nodo 42
+uno->valor = 42
+destruye nodo 42
+crea nodo por defecto
+crea nodo por defecto
+crea nodo por defecto
+ultimo = 33
+destruye nodo 33
+destruye nodo 22
+destruye nodo 11
+suma de cuadrados = 30

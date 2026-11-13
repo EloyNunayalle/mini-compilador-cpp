@@ -1,0 +1,7 @@
+# Variante con el compilador falso, para probar el stack sin el compilador real.
+services:
+  web:
+    volumes:
+      - ./tests_api/mock_compiler.py:/app/mock_compiler.py:ro
+    environment:
+      COMPILER_BIN: /app/mock_compiler.py

@@ -74,6 +74,7 @@ bool Parser::isBaseTypeStart() const {
         case Token::KW_CHAR:
         case Token::KW_VOID:
         case Token::LIB_STRING:
+        case Token::KW_CONST:
             return true;
         case Token::ID:
             if (knownTypes.find(current->text) != knownTypes.end()) return true;
@@ -92,6 +93,22 @@ bool Parser::peekIsStdString() const {
     delete t1;
     delete t2;
     return res;
+}
+
+Token::Type Parser::peekTokenType() const {
+    Scanner lookahead(*scanner);
+    Token* t = lookahead.nextToken();
+    Token::Type ty = t ? t->type : Token::END;
+    delete t;
+    return ty;
+}
+
+// Un nombre de tipo seguido de '(' al inicio de una sentencia es una construccion
+// de temporal, no una declaracion
+bool Parser::startsCtorCall() const {
+    if (!current || current->type != Token::ID) return false;
+    if (knownTypes.find(current->text) == knownTypes.end()) return false;
+    return peekTokenType() == Token::LPAREN;
 }
 
 // =========================================================================
@@ -196,6 +213,15 @@ vector<string> Parser::parseQualifiedId() {
 // =========================================================================
 
 Type Parser::parseBaseType() {
+    unsigned cbits = 0;
+    while (match(Token::KW_CONST)) cbits |= 1u;
+    Type t = parseBaseTypeCore();
+    while (match(Token::KW_CONST)) cbits |= 1u;
+    t.constBits |= cbits;
+    return t;
+}
+
+Type Parser::parseBaseTypeCore() {
     if (match(Token::KW_INT))    return Type(Type::INT);
     if (match(Token::KW_FLOAT))  return Type(Type::FLOAT);
     if (match(Token::KW_DOUBLE)) return Type(Type::DOUBLE);
@@ -227,6 +253,7 @@ Type Parser::parseReturnType() {
     Type t = parseBaseType();
     while (match(Token::MUL)) {
         t.ptrLevel++;
+        while (match(Token::KW_CONST)) t.constBits |= (1u << t.ptrLevel);
     }
     if (match(Token::AMP)) {
         t.isRef = true;
@@ -242,6 +269,9 @@ ASTNode* Parser::parseDecl() {
     if (check(Token::KW_CLASS) || check(Token::KW_STRUCT)) {
         return parseRecordDecl();
     }
+    if (check(Token::KW_OPERATOR)) {
+        error("Sobrecarga de operadores no soportada: solo 'operator=' como miembro de una clase");
+    }
 
     // Distinción entre Función y Variable
     // Ambos inician con un ReturnType / BaseType.
@@ -250,8 +280,23 @@ ASTNode* Parser::parseDecl() {
     Token* idTok = consume(Token::ID, "Se esperaba nombre del identificador en la declaración");
     string name = idTok->text;
 
+    bool isFunction = false;
     if (check(Token::LPAREN)) {
-        // Es una función!
+        // T g(args); es una variable con inicializacion directa; T f(params) {...} es una funcion
+        Token::Type next = peekTokenType();
+        isFunction = next == Token::RPAREN || next == Token::KW_CONST || next == Token::KW_INT ||
+                     next == Token::KW_FLOAT || next == Token::KW_DOUBLE || next == Token::KW_BOOL ||
+                     next == Token::KW_CHAR || next == Token::KW_VOID || next == Token::LIB_STRING;
+        if (!isFunction && next == Token::ID) {
+            Scanner lookahead(*scanner);
+            Token* t1 = lookahead.nextToken();
+            isFunction = t1 && knownTypes.find(t1->text) != knownTypes.end();
+            if (t1 && t1->text == "std") isFunction = true;
+            delete t1;
+        }
+    }
+
+    if (isFunction) {
         advance(); // consume '('
         vector<Param*> params = parseParamDeclList();
         consume(Token::RPAREN, "Se esperaba ')' tras la lista de parámetros");
@@ -267,10 +312,20 @@ ASTNode* Parser::parseDecl() {
             dims = parseArrayDims();
         }
         Exp* init = nullptr;
+        vector<Exp*> ctorArgs;
+        bool direct = false;
         if (match(Token::ASSIGN)) {
             init = parseInitializer();
+        } else if (dims.empty() && match(Token::LPAREN)) {
+            ctorArgs = parseArgList();
+            consume(Token::RPAREN, "Se esperaba ')' tras los argumentos de inicialización");
+            direct = true;
         }
-        vdecl->inits.push_back(new VarInit(name, type.ptrLevel, type.isRef, dims, init, idTok->line, idTok->col));
+        VarInit* first = new VarInit(name, type.ptrLevel, type.isRef, dims, init, idTok->line, idTok->col);
+        first->ptrConst = type.constBits & ~1u;
+        first->ctorArgs = ctorArgs;
+        first->directInit = direct;
+        vdecl->inits.push_back(first);
 
         // Declaraciones adicionales en la misma línea: , var2, *var3
         while (match(Token::COMMA)) {
@@ -282,9 +337,19 @@ ASTNode* Parser::parseDecl() {
     }
 }
 
+unsigned Parser::parsePtrDeclarator(int& ptrs) {
+    unsigned bits = 0;
+    ptrs = 0;
+    while (match(Token::MUL)) {
+        ptrs++;
+        while (match(Token::KW_CONST)) bits |= (1u << ptrs);
+    }
+    return bits;
+}
+
 VarInit* Parser::parseVarInit(const Type& /*baseType*/) {
     int ptrs = 0;
-    while (match(Token::MUL)) ptrs++;
+    unsigned pconst = parsePtrDeclarator(ptrs);
 
     bool isRef = false;
     if (match(Token::AMP)) isRef = true;
@@ -296,13 +361,23 @@ VarInit* Parser::parseVarInit(const Type& /*baseType*/) {
     }
 
     Exp* init = nullptr;
+    vector<Exp*> ctorArgs;
+    bool direct = false;
     if (match(Token::ASSIGN)) {
         init = parseInitializer();
     } else if (isRef) {
         error("Las referencias en C++ deben ser inicializadas obligatoriamente");
+    } else if (dims.empty() && match(Token::LPAREN)) {
+        ctorArgs = parseArgList();
+        consume(Token::RPAREN, "Se esperaba ')' tras los argumentos de inicialización");
+        direct = true;
     }
 
-    return new VarInit(idTok->text, ptrs, isRef, dims, init, idTok->line, idTok->col);
+    VarInit* vi = new VarInit(idTok->text, ptrs, isRef, dims, init, idTok->line, idTok->col);
+    vi->ptrConst = pconst;
+    vi->ctorArgs = ctorArgs;
+    vi->directInit = direct;
+    return vi;
 }
 
 VarDecl* Parser::parseVarDecl() {
@@ -349,7 +424,7 @@ Param* Parser::parseParam() {
     Type bt = parseBaseType();
 
     int ptrs = 0;
-    while (match(Token::MUL)) ptrs++;
+    unsigned pconst = parsePtrDeclarator(ptrs);
 
     bool isRef = false;
     if (match(Token::AMP)) isRef = true;
@@ -360,7 +435,9 @@ Param* Parser::parseParam() {
         dims = parseArrayDims();
     }
 
-    return new Param(bt, idTok->text, ptrs, isRef, dims, l, c);
+    Param* prm = new Param(bt, idTok->text, ptrs, isRef, dims, l, c);
+    prm->ptrConst = pconst;
+    return prm;
 }
 
 RecordDecl* Parser::parseRecordDecl() {
@@ -391,15 +468,43 @@ RecordDecl* Parser::parseRecordDecl() {
             continue;
         }
 
+        // Destructor: ~Nombre()
+        if (check(Token::BIT_NOT)) {
+            members.push_back(parseDtorMember(recordName, currentAccess));
+            continue;
+        }
+        // Constructor: Nombre(...)
+        if (check(Token::ID) && current->text == recordName && peekTokenType() == Token::LPAREN) {
+            members.push_back(parseCtorMember(recordName, currentAccess));
+            continue;
+        }
+
         // Miembro: VarDecl o FunDecl
         Type type = parseReturnType();
+        if (check(Token::KW_OPERATOR)) {
+            Token* opTok = current;
+            advance();
+            if (!match(Token::ASSIGN)) {
+                error("Solo se permite sobrecargar 'operator='");
+            }
+            consume(Token::LPAREN, "Se esperaba '(' tras 'operator='");
+            vector<Param*> params = parseParamDeclList();
+            consume(Token::RPAREN, "Se esperaba ')' tras parámetros de 'operator='");
+            BlockStmt* body = parseBlock();
+            FunDecl* fd = new FunDecl(type, "operator=", params, body, opTok->line, opTok->col);
+            fd->funKind = FunKind::COPY_ASSIGN;
+            members.push_back(new RecordMember(currentAccess, nullptr, fd, opTok->line, opTok->col));
+            continue;
+        }
         Token* id = consume(Token::ID, "Se esperaba nombre del miembro");
         if (check(Token::LPAREN)) {
             advance(); // '('
             vector<Param*> params = parseParamDeclList();
             consume(Token::RPAREN, "Se esperaba ')' tras parámetros del método");
+            bool isConst = match(Token::KW_CONST);
             BlockStmt* body = parseBlock();
             FunDecl* fd = new FunDecl(type, id->text, params, body, id->line, id->col);
+            fd->isConst = isConst;
             members.push_back(new RecordMember(currentAccess, nullptr, fd, id->line, id->col));
         } else {
             VarDecl* vd = new VarDecl(type, id->line, id->col);
@@ -407,7 +512,9 @@ RecordDecl* Parser::parseRecordDecl() {
             if (check(Token::LBRACKET)) dims = parseArrayDims();
             Exp* init = nullptr;
             if (match(Token::ASSIGN)) init = parseInitializer();
-            vd->inits.push_back(new VarInit(id->text, type.ptrLevel, type.isRef, dims, init, id->line, id->col));
+            VarInit* first = new VarInit(id->text, type.ptrLevel, type.isRef, dims, init, id->line, id->col);
+            first->ptrConst = type.constBits & ~1u;
+            vd->inits.push_back(first);
             while (match(Token::COMMA)) {
                 vd->inits.push_back(parseVarInit(type));
             }
@@ -422,6 +529,63 @@ RecordDecl* Parser::parseRecordDecl() {
     return new RecordDecl(kind, recordName, members, l, c);
 }
 
+RecordMember* Parser::parseCtorMember(const string& recordName, AccessSpecifier access) {
+    Token* nameTok = consume(Token::ID, "Se esperaba el nombre del constructor");
+    consume(Token::LPAREN, "Se esperaba '(' en el constructor");
+    vector<Param*> params = parseParamDeclList();
+    consume(Token::RPAREN, "Se esperaba ')' tras los parámetros del constructor");
+    vector<MemberInit> inits;
+    if (match(Token::COLON)) {
+        inits = parseMemberInitList();
+    }
+    BlockStmt* body = parseBlock();
+    FunDecl* fd = new FunDecl(Type(Type::VOID), recordName, params, body, nameTok->line, nameTok->col);
+    fd->funKind = FunKind::CTOR;
+    fd->memberInits = inits;
+    return new RecordMember(access, nullptr, fd, nameTok->line, nameTok->col);
+}
+
+RecordMember* Parser::parseDtorMember(const string& recordName, AccessSpecifier access) {
+    Token* tilde = consume(Token::BIT_NOT, "Se esperaba '~'");
+    Token* nameTok = consume(Token::ID, "Se esperaba el nombre de la clase tras '~'");
+    if (nameTok->text != recordName) {
+        error("El destructor debe llamarse '~" + recordName + "'");
+    }
+    consume(Token::LPAREN, "Se esperaba '(' en el destructor");
+    if (!check(Token::RPAREN)) {
+        error("El destructor no admite parámetros");
+    }
+    consume(Token::RPAREN, "Se esperaba ')' en el destructor");
+    BlockStmt* body = parseBlock();
+    FunDecl* fd = new FunDecl(Type(Type::VOID), "~" + recordName, {}, body, tilde->line, tilde->col);
+    fd->funKind = FunKind::DTOR;
+    return new RecordMember(access, nullptr, fd, tilde->line, tilde->col);
+}
+
+// campo(expr) { , campo(expr) } o campo{expr}
+vector<MemberInit> Parser::parseMemberInitList() {
+    vector<MemberInit> list;
+    do {
+        Token* n = consume(Token::ID, "Se esperaba el nombre de un miembro en la lista de inicialización");
+        MemberInit mi;
+        mi.name = n->text;
+        mi.line = n->line;
+        mi.col = n->col;
+        if (match(Token::LPAREN)) {
+            mi.args = parseArgList();
+            consume(Token::RPAREN, "Se esperaba ')' en la lista de inicialización");
+        } else if (match(Token::LBRACE)) {
+            mi.braces = true;
+            if (!check(Token::RBRACE)) mi.args = parseArgList();
+            consume(Token::RBRACE, "Se esperaba '}' en la lista de inicialización");
+        } else {
+            error("Se esperaba '(' o '{' tras el miembro '" + n->text + "' en la lista de inicialización");
+        }
+        list.push_back(mi);
+    } while (match(Token::COMMA));
+    return list;
+}
+
 // =========================================================================
 // Bloques y Sentencias
 // =========================================================================
@@ -434,7 +598,7 @@ BlockStmt* Parser::parseBlock() {
     BlockStmt* block = new BlockStmt(l, c);
 
     while (!check(Token::RBRACE) && !isAtEnd()) {
-        if (isBaseTypeStart()) {
+        if (isBaseTypeStart() && !startsCtorCall()) {
             block->items.push_back(parseVarDecl());
         } else {
             block->items.push_back(parseStmt());
@@ -501,7 +665,7 @@ ForStmt* Parser::parseForStmt() {
     // ForInit ::= VarDeclNoSemicolon | CExp { "," CExp } | vacio
     VarDecl* initDecl = nullptr;
     vector<Exp*> initExprs;
-    if (isBaseTypeStart()) {
+    if (isBaseTypeStart() && !startsCtorCall()) {
         initDecl = parseVarDeclNoSemicolon();
     } else if (!check(Token::SEMICOL)) {
         initExprs.push_back(parseCExp());
@@ -805,11 +969,20 @@ Exp* Parser::parseNewExpr() {
     }
 
     vector<Exp*> dims;
+    vector<Exp*> ctorArgs;
+    bool parens = false;
     if (check(Token::LBRACKET)) {
         dims = parseArrayDims();
+    } else if (match(Token::LPAREN)) {
+        parens = true;
+        ctorArgs = parseArgList();
+        consume(Token::RPAREN, "Se esperaba ')' tras los argumentos de 'new'");
     }
 
-    return new NewExp(targetType, dims, l, c);
+    NewExp* ne = new NewExp(targetType, dims, l, c);
+    ne->ctorArgs = ctorArgs;
+    ne->hasParens = parens;
+    return ne;
 }
 
 // Postfix ::= Primary { PostfixSuffix }

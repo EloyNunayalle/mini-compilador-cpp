@@ -48,6 +48,10 @@ public:
         KW_USING,
         KW_NAMESPACE,
 
+        // Calificador y operador
+        KW_CONST,
+        KW_OPERATOR,
+
         // Librerías reconocidas
         LIB_IOSTREAM,
         LIB_STRING,

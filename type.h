@@ -39,6 +39,10 @@ public:
     string stringValue;
     bool isConstExpr;
 
+    // Calificadores const por nivel: el bit 0 es el tipo base, el bit k (k >= 1) es el
+    // k-esimo puntero. El objeto que nombra el tipo es const si lo es el bit ptrLevel.
+    unsigned constBits;
+
     Type();                                     // VOID
     Type(Kind k, int ptr = 0, bool ref = false);
     Type(int val);                              // INT literal
@@ -68,6 +72,15 @@ public:
     Type elementType() const;  // quita la dimension mas externa del arreglo
     Type withoutRef() const;
     bool sameBase(const Type& other) const; // mismo tipo base y nivel de puntero, ignora ref y dimensiones
+
+    bool constAt(int level) const { return (constBits >> level) & 1u; }
+    bool isConstObj() const { return constAt(ptrLevel); }   // el objeto en si es const
+    bool isPointeeConst() const { return ptrLevel > 0 && constAt(ptrLevel - 1); }
+    Type withTopConst(bool c = true) const;     // marca el objeto como const
+    Type pointee() const;                       // quita un nivel de puntero
+    Type addressOf() const;                     // agrega un nivel de puntero
+    Type withoutConst() const;                  // quita el const del objeto
+    bool sameConstBits(const Type& other) const { return constBits == other.constBits; }
 
     bool operator==(const Type& other) const;
     bool operator!=(const Type& other) const;

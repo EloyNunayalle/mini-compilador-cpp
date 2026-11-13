@@ -40,6 +40,8 @@ string Token::typeName(Type t) {
         case KW_INCLUDE:     return "KW_INCLUDE";
         case KW_USING:       return "KW_USING";
         case KW_NAMESPACE:   return "KW_NAMESPACE";
+        case KW_CONST:       return "KW_CONST";
+        case KW_OPERATOR:    return "KW_OPERATOR";
         case LIB_IOSTREAM:   return "LIB_IOSTREAM";
         case LIB_STRING:     return "LIB_STRING";
         case LIB_CMATH:      return "LIB_CMATH";

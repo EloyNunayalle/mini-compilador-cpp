@@ -131,6 +131,7 @@ NewExp::NewExp(const Type& t, const vector<Exp*>& dims, int line, int col)
 
 NewExp::~NewExp() {
     for (Exp* d : arrayDims) delete d;
+    for (Exp* a : ctorArgs) delete a;
 }
 
 DeleteExp::DeleteExp(bool isArr, Exp* e, int line, int col)
@@ -223,6 +224,7 @@ VarInit::VarInit(const string& n, int ptrs, bool ref, const vector<Exp*>& dims, 
 
 VarInit::~VarInit() {
     for (Exp* d : arrayDims) delete d;
+    for (Exp* a : ctorArgs) delete a;
     delete initializer;
 }
 
@@ -245,6 +247,9 @@ FunDecl::FunDecl(const Type& retT, const string& n, const vector<Param*>& ps, Bl
 
 FunDecl::~FunDecl() {
     for (Param* p : params) delete p;
+    for (MemberInit& mi : memberInits) {
+        for (Exp* a : mi.args) delete a;
+    }
     delete body;
 }
 
@@ -261,6 +266,7 @@ RecordDecl::RecordDecl(RecordKind k, const string& n, const vector<RecordMember*
 
 RecordDecl::~RecordDecl() {
     for (RecordMember* m : members) delete m;
+    for (FunDecl* f : implicitFuns) delete f;
 }
 
 IncludeDirective::IncludeDirective(const string& lib, int line, int col)

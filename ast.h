@@ -10,6 +10,8 @@
 using namespace std;
 
 class Visitor;
+class Exp;
+class FunDecl;
 
 // Identificador de clase de nodo, evita RTTI y dynamic_cast
 enum class NodeKind {
@@ -36,7 +38,8 @@ enum CallKind {
     CALL_FUNCTION,
     CALL_METHOD,          // obj.m() o ptr->m()
     CALL_METHOD_IMPLICIT, // m() dentro de otro metodo del mismo record
-    CALL_BUILTIN
+    CALL_BUILTIN,
+    CALL_CTOR             // T(args): construye un temporal
 };
 
 enum Builtin {
@@ -62,6 +65,59 @@ enum BinaryMode {
     BM_STR_STR,        // ==, != entre strings
     BM_STR_CSTR,
     BM_CSTR_STR
+};
+
+// Como se pasa cada argumento (lo decide el TypeChecker, el Gencode solo lo ejecuta)
+enum ArgMode {
+    AM_VALUE,      // escalar convertido al tipo del parametro
+    AM_REF,        // direccion de un lvalue (referencias y punteros a objeto)
+    AM_REF_TEMP,   // valor convertido a un temporal; se pasa su direccion
+    AM_AGG,        // record trivial por valor (registros o pila segun la ABI)
+    AM_COPY        // record no trivial por valor: copia en un temporal y se pasa su direccion
+};
+
+struct ArgInfo {
+    ArgMode mode = AM_VALUE;
+    Type ptype;            // tipo del parametro declarado
+    int tempOffset = 0;    // temporal usado por AM_REF_TEMP y AM_COPY
+};
+
+// Como se inicializa un objeto
+enum InitKind {
+    IK_NONE,      // sin inicializar (escalares) o sin accion
+    IK_VALUE,     // escalar, puntero o string desde una expresion
+    IK_REF,       // enlace de una referencia
+    IK_DEFAULT,   // construccion por defecto
+    IK_CTOR,      // llamada a un constructor con argumentos
+    IK_COPY,      // copia desde otro objeto del mismo tipo
+    IK_BRACED     // lista con llaves
+};
+
+struct InitSpec {
+    InitKind kind = IK_NONE;
+    Exp* expr = nullptr;           // IK_VALUE, IK_REF, IK_COPY, IK_BRACED (no es dueno)
+    vector<Exp*> args;             // IK_CTOR (no es dueno)
+    vector<ArgInfo> argInfo;
+    FunDecl* ctor = nullptr;       // constructor a invocar; null si la operacion es trivial
+    int tempOffset = 0;            // IK_REF: temporal si se enlaza una referencia const a un valor
+};
+
+// Funciones miembro especiales
+enum class FunKind { NORMAL, CTOR, DTOR, COPY_ASSIGN };
+
+// Entrada de la lista de inicializacion de un constructor, tal como la escribe el usuario
+struct MemberInit {
+    string name;
+    vector<Exp*> args;
+    bool braces = false;
+    int line = 0;
+    int col = 0;
+};
+
+// Plan de inicializacion de un campo en un constructor, en orden de declaracion
+struct FieldInit {
+    int fieldIndex = -1;
+    InitSpec spec;
 };
 
 // =========================================================================
@@ -258,6 +314,10 @@ public:
     int ptrScale = 0;          // POST_INC/POST_DEC sobre punteros
     CallKind callKind = CALL_NONE;
     FunDecl* callee = nullptr;
+    vector<ArgInfo> argInfo;   // CALL_ACCESS: como se pasa cada argumento
+    int retTemp = 0;           // temporal que recibe un record o string devuelto por valor
+    bool fieldIsRef = false;   // DOT/ARROW: el campo es una referencia
+    InitKind ctorKind = IK_NONE;  // CALL_CTOR: IK_DEFAULT, IK_COPY o IK_CTOR
     Builtin builtin = BI_NONE;
     Exp* base;
     PostfixKind kind;
@@ -276,6 +336,12 @@ public:
     int elemSize = 0;          // tamano de una instancia de allocType
     Type allocType;
     vector<Exp*> arrayDims;
+    vector<Exp*> ctorArgs;     // new T(args)
+    bool hasParens = false;    // se escribio new T(...)
+    InitSpec spec;             // constructor a invocar sobre cada objeto
+    bool valueInit = false;    // new T(): pone a cero antes de construir cuando no hay ctor del usuario
+    bool hasCookie = false;    // new T[n] guarda el numero de elementos para delete[]
+    int ptrTemp = 0;           // temporal que guarda el puntero reservado
     NewExp(const Type& t, const vector<Exp*>& dims, int line = 1, int col = 1);
     NodeKind nodeKind() const override { return NodeKind::NEW_EXP; }
     Type accept(Visitor* visitor) override;
@@ -286,6 +352,8 @@ public:
 class DeleteExp : public Exp {
 public:
     bool isArray;
+    bool hasCookie = false;    // delete[] sobre un tipo con destructor: lee el numero de elementos
+    Type pointeeType;          // tipo del objeto apuntado
     Exp* exp;
     DeleteExp(bool isArray, Exp* exp, int line = 1, int col = 1);
     NodeKind nodeKind() const override { return NodeKind::DELETE_EXP; }
@@ -299,6 +367,16 @@ public:
     vector<int> elementOffsets;   // offset de cada elemento dentro del agregado
     vector<Type> elementTypes;
     vector<Exp*> elements;
+    // Campos omitidos de un agregado: se inicializan con su inicializador de clase
+    // o por defecto; el resto del objeto queda en cero
+    struct Omitted {
+        int offset = 0;
+        Type type;
+        InitSpec spec;
+        int count = 1;            // elementos consecutivos (arreglos)
+    };
+    vector<Omitted> omitted;
+    Type aggType;                 // tipo del objeto que se inicializa
     BracedInitList(const vector<Exp*>& elems, int line = 1, int col = 1);
     NodeKind nodeKind() const override { return NodeKind::BRACED_INIT; }
     Type accept(Visitor* visitor) override;
@@ -362,11 +440,15 @@ public:
 class VarInit : public ASTNode {
 public:
     VarInfo info;              // lo completa el TypeChecker
+    InitSpec spec;             // como se inicializa, lo completa el TypeChecker
     string name;
     int ptrCount;
     bool isRef;
+    unsigned ptrConst = 0;     // bit k: el k-esimo puntero del declarador es const
     vector<Exp*> arrayDims;
     Exp* initializer; // Puede ser nullptr
+    vector<Exp*> ctorArgs;     // T t(args)
+    bool directInit = false;
     VarInit(const string& n, int ptrs, bool ref, const vector<Exp*>& dims, Exp* init, int line = 1, int col = 1);
     NodeKind nodeKind() const override { return NodeKind::VAR_INIT; }
     void accept(Visitor* visitor) override;
@@ -450,6 +532,7 @@ public:
     string name;
     int ptrCount;
     bool isRef;
+    unsigned ptrConst = 0;
     vector<Exp*> arrayDims;
     Param(const Type& t, const string& n, int ptrs, bool ref, const vector<Exp*>& dims, int line = 1, int col = 1);
     NodeKind nodeKind() const override { return NodeKind::PARAM; }
@@ -465,6 +548,12 @@ public:
     string name;
     vector<Param*> params;
     BlockStmt* body;
+    FunKind funKind = FunKind::NORMAL;
+    bool isConst = false;      // metodo const
+    bool isImplicit = false;   // generada por el compilador
+    bool isPrivate = false;
+    vector<MemberInit> memberInits;   // lista de inicializacion escrita por el usuario
+    vector<FieldInit> fieldInits;     // plan completo, lo arma el TypeChecker
     FunDecl(const Type& retT, const string& n, const vector<Param*>& ps, BlockStmt* b, int line = 1, int col = 1);
     NodeKind nodeKind() const override { return NodeKind::FUN_DECL; }
     void accept(Visitor* visitor) override;
@@ -500,6 +589,7 @@ public:
     RecordKind kind;
     string name;
     vector<RecordMember*> members;
+    vector<FunDecl*> implicitFuns;    // operaciones especiales generadas por el compilador
     RecordDecl(RecordKind k, const string& n, const vector<RecordMember*>& mems, int line = 1, int col = 1);
     NodeKind nodeKind() const override { return NodeKind::RECORD_DECL; }
     void accept(Visitor* visitor) override;
@@ -536,10 +626,15 @@ public:
     vector<IncludeDirective*> includes;
     vector<UsingDirective*> usings;
     vector<ASTNode*> declarations; // VarDecl*, FunDecl*, RecordDecl*
+    int initFrameSize = 0;         // marco de la rutina que inicializa los globales
     Program(int line = 1, int col = 1);
     NodeKind nodeKind() const override { return NodeKind::PROGRAM; }
     void accept(Visitor* visitor) override;
     ~Program() override;
 };
+
+// Copia profunda de una expresion. Las anotaciones del TypeChecker se copian tal cual;
+// quien use el clon debe volver a verificar el arbol.
+Exp* cloneExp(const Exp* e);
 
 #endif // AST_H

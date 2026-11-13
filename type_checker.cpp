@@ -14,16 +14,18 @@ static Type makeType(Type::Kind k, int ptr = 0) {
 TypeChecker::TypeChecker()
     : currentFunction(nullptr), currentRecord(nullptr), loopDepth(0),
       hasIostream(false), hasString(false), hasCmath(false), usingNamespaceStd(false),
-      frameUsed(0), paramIndex(0) {}
+      frameUsed(0), initFrameUsed(0), paramIndex(0), program(nullptr) {}
 
 void TypeChecker::addError(const string& msg, int line, int col) {
     string loc = (line > 0) ? "[Línea " + to_string(line) + ", Columna " + to_string(col) + "] " : "";
     errors.push_back("Error Semántico " + loc + msg);
+    errorList.push_back({"typecheck", msg, line, col});
 }
 
 void TypeChecker::addWarning(const string& msg, int line, int col) {
     string loc = (line > 0) ? "[Línea " + to_string(line) + ", Columna " + to_string(col) + "] " : "";
     warnings.push_back("Advertencia " + loc + msg);
+    warningList.push_back({"typecheck", msg, line, col});
 }
 
 bool TypeChecker::hasErrors() const {
@@ -56,14 +58,19 @@ void TypeChecker::check(Program* prog) {
     records.clear();
     errors.clear();
     warnings.clear();
+    errorList.clear();
+    warningList.clear();
     usingNames.clear();
     hasIostream = hasString = hasCmath = usingNamespaceStd = false;
     currentFunction = nullptr;
     currentRecord = nullptr;
     loopDepth = 0;
     frameUsed = 0;
+    initFrameUsed = 0;
+    program = prog;
 
     prog->accept(this);
+    prog->initFrameSize = alignUp(initFrameUsed, 16);
 
     if (!functions.count("main")) {
         addWarning("El programa no contiene la función 'main' requerida para la ejecución en C++.");
@@ -113,6 +120,38 @@ bool TypeChecker::stdNameVisible(const IdExp* id, const string& name) const {
     return false;
 }
 
+// Conversion de calificadores entre punteros del mismo tipo base y nivel: no se puede
+// quitar const y agregarlo en un nivel interno exige const en todos los niveles intermedios
+bool TypeChecker::qualConvertible(const Type& to, const Type& from) const {
+    int n = to.ptrLevel;
+    for (int k = 0; k < n; k++) {
+        bool tc = to.constAt(k);
+        bool fc = from.constAt(k);
+        if (fc && !tc) return false;
+        if (tc && !fc) {
+            for (int j = k + 1; j < n; j++) {
+                if (!to.constAt(j)) return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Enlace directo de una referencia a un lvalue: los niveles internos deben coincidir
+bool TypeChecker::refBindable(const Type& target, const Type& from) const {
+    if (target.ptrLevel != from.ptrLevel) return false;
+    for (int k = 0; k < target.ptrLevel; k++) {
+        if (target.constAt(k) != from.constAt(k)) return false;
+    }
+    if (from.isConstObj() && !target.isConstObj()) return false;
+    return true;
+}
+
+bool TypeChecker::isRecordRvalueOf(Exp* e, const Type& rec) const {
+    Type t = e->inferredType.withoutRef();
+    return !e->isLValue && t.isRecord() && t.recordName == rec.recordName;
+}
+
 bool TypeChecker::assignable(const Type& toRaw, Exp* from) {
     Type to = toRaw.withoutRef();
     Type fr = decay(from->inferredType.withoutRef());
@@ -126,14 +165,22 @@ bool TypeChecker::assignable(const Type& toRaw, Exp* from) {
     if (to.isPointer()) {
         if (isNullLiteral(from)) return true;
         if (!fr.isPointer()) return false;
-        if (to.sameBase(fr)) return true;
-        return to.kind == Type::VOID && to.ptrLevel == 1;
+        // un literal de cadena se acepta como char* (GCC lo admite con advertencia)
+        if (from->nodeKind() == NodeKind::STRING_EXP && to.kind == Type::CHAR && to.ptrLevel == 1) return true;
+        if (to.sameBase(fr)) return qualConvertible(to, fr);
+        if (to.kind == Type::VOID && to.ptrLevel == 1) {
+            // cualquier puntero a void*, sin perder const del objeto apuntado
+            return !(fr.constAt(fr.ptrLevel - 1) && !to.constAt(0));
+        }
+        return false;
     }
     if (to.isString()) {
         return fr.isString() || (fr.kind == Type::CHAR && fr.ptrLevel == 1);
     }
     if (to.isRecord()) {
-        return fr.isRecord() && to.recordName == fr.recordName && !hasStrings(to);
+        if (!fr.isRecord() || to.recordName != fr.recordName) return false;
+        RecordLayout* L = layoutOf(to);
+        return L && L->copyCtorAvail != Avail::DELETED;
     }
     return false;
 }
@@ -150,6 +197,20 @@ bool TypeChecker::constEval(Exp* e, long long& out) {
         case NodeKind::BOOL_EXP:
             out = static_cast<BoolExp*>(e)->value ? 1 : 0;
             return true;
+        case NodeKind::ID_EXP: {
+            IdExp* id = static_cast<IdExp*>(e);
+            if (id->parts.size() != 1) return false;
+            VarInfo vi;
+            if (env.lookup(id->parts[0], vi)) {
+                if (!vi.hasConstVal) return false;
+                out = vi.constVal;
+                return true;
+            }
+            auto it = globalConsts.find(id->parts[0]);
+            if (it == globalConsts.end()) return false;
+            out = it->second;
+            return true;
+        }
         case NodeKind::UNARY_EXP: {
             UnaryExp* u = static_cast<UnaryExp*>(e);
             long long v;
@@ -193,7 +254,43 @@ bool TypeChecker::constEval(Exp* e, long long& out) {
     }
 }
 
-// Tamanos, alineaciones y strings contenidos (modelo LP64)
+// Los inicializadores de campo en la clase se limitan a expresiones constantes: asi se
+// pueden evaluar en cualquier constructor sin depender de un marco de funcion
+bool TypeChecker::isConstantInit(Exp* e) const {
+    switch (e->nodeKind()) {
+        case NodeKind::NUMBER_EXP:
+        case NodeKind::REAL_EXP:
+        case NodeKind::BOOL_EXP:
+        case NodeKind::CHAR_EXP:
+        case NodeKind::STRING_EXP:
+        case NodeKind::NULLPTR_EXP:
+            return true;
+        case NodeKind::UNARY_EXP: {
+            UnaryExp* u = static_cast<UnaryExp*>(e);
+            if (u->op == DEREF_UNARY || u->op == ADDR_UNARY || u->op == PRE_INC_UNARY || u->op == PRE_DEC_UNARY)
+                return false;
+            return isConstantInit(u->exp);
+        }
+        case NodeKind::BINARY_EXP: {
+            BinaryExp* b = static_cast<BinaryExp*>(e);
+            if (b->op == LSHIFT_OP || b->op == RSHIFT_OP) {
+                // los desplazamientos se admiten solo entre constantes enteras
+            }
+            return isConstantInit(b->left) && isConstantInit(b->right);
+        }
+        case NodeKind::BRACED_INIT: {
+            BracedInitList* bl = static_cast<BracedInitList*>(e);
+            for (Exp* x : bl->elements) {
+                if (!isConstantInit(x)) return false;
+            }
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+// Tamanos, alineaciones y propiedades de ciclo de vida (modelo LP64)
 
 int TypeChecker::sizeOf(const Type& t) {
     if (t.isRef) return 8;
@@ -238,32 +335,65 @@ int TypeChecker::alignOf(const Type& t) {
     }
 }
 
-bool TypeChecker::hasStrings(const Type& t) {
-    if (t.isRef || t.ptrLevel > 0) return false;
-    if (t.kind == Type::STRING) return true;
-    if (t.kind == Type::RECORD) {
-        auto it = records.find(t.recordName);
-        return it != records.end() && !it->second->layout.stringOffsets.empty();
-    }
-    return false;
+bool TypeChecker::isClassObj(const Type& t) const {
+    return (t.kind == Type::RECORD || t.kind == Type::STRING) && t.ptrLevel == 0 && !t.isRef;
 }
 
-void TypeChecker::collectStringOffsets(const Type& t, vector<int>& out) {
-    if (t.isRef || t.ptrLevel > 0 || t.isArray()) return;
-    if (t.kind == Type::STRING) {
-        out.push_back(0);
-    } else if (t.kind == Type::RECORD) {
-        auto it = records.find(t.recordName);
-        if (it != records.end()) {
-            for (int o : it->second->layout.stringOffsets) out.push_back(o);
-        }
-    }
+bool TypeChecker::isByValueClass(const Type& t) const {
+    return isClassObj(t) && t.arrayDims.empty();
+}
+
+RecordLayout* TypeChecker::layoutOf(const Type& t) {
+    if (t.kind != Type::RECORD) return nullptr;
+    auto it = records.find(t.recordName);
+    return it == records.end() ? nullptr : &it->second->layout;
+}
+
+bool TypeChecker::hasStringIn(const Type& t) {
+    if (!isClassObj(t)) return false;
+    if (t.kind == Type::STRING) return true;
+    RecordLayout* L = layoutOf(t);
+    return L && L->hasString;
+}
+
+bool TypeChecker::dtorTrivial(const Type& t) {
+    if (!isClassObj(t)) return true;
+    if (t.kind == Type::STRING) return false;
+    RecordLayout* L = layoutOf(t);
+    return !L || L->dtorTrivial;
+}
+
+bool TypeChecker::copyTrivial(const Type& t) {
+    if (!isClassObj(t)) return true;
+    if (t.kind == Type::STRING) return false;
+    RecordLayout* L = layoutOf(t);
+    return !L || L->copyTrivial;
+}
+
+bool TypeChecker::assignTrivial(const Type& t) {
+    if (!isClassObj(t)) return true;
+    if (t.kind == Type::STRING) return false;
+    RecordLayout* L = layoutOf(t);
+    return !L || L->assignTrivial;
+}
+
+bool TypeChecker::defaultTrivial(const Type& t) {
+    if (!isClassObj(t)) return true;
+    if (t.kind == Type::STRING) return false;
+    RecordLayout* L = layoutOf(t);
+    return !L || L->defaultTrivial;
+}
+
+const RecordAbi& TypeChecker::abiOf(const Type& t) {
+    static RecordAbi stringAbi;
+    stringAbi.trivialForCalls = false;
+    RecordLayout* L = layoutOf(t);
+    if (L) return L->abi;
+    return stringAbi;
 }
 
 int TypeChecker::pointeeSize(const Type& ptr, int line, int col) {
-    Type p = ptr;
-    p.ptrLevel--;
-    p.arrayDims.clear();
+    Type p = ptr.pointee();
     if (p.kind == Type::VOID && p.ptrLevel == 0) {
         addError("Aritmética o desreferencia sobre 'void*' no permitida", line, col);
         return 1;
@@ -292,11 +422,13 @@ Type TypeChecker::resolveType(Type t, int line, int col) {
     return t;
 }
 
-Type TypeChecker::declaredType(const Type& base, int ptrs, bool ref, const vector<Exp*>& dims, int line, int col) {
+Type TypeChecker::declaredType(const Type& base, int ptrs, bool ref, unsigned ptrConst,
+                               const vector<Exp*>& dims, int line, int col) {
     Type t = base;
     t.ptrLevel = ptrs;
     t.isRef = ref;
     t.arrayDims.clear();
+    t.constBits = (base.constBits & 1u) | ptrConst;
     t = resolveType(t, line, col);
     if (t.isError()) return t;
 
@@ -324,8 +456,11 @@ VarInfo TypeChecker::allocLocal(const Type& t) {
     int sz = info.size > 0 ? info.size : 1;
     frameUsed = alignUp(frameUsed + sz, info.align);
     info.offset = -frameUsed;
-    collectStringOffsets(t, info.stringOffsets);
     return info;
+}
+
+int TypeChecker::allocTemp(const Type& t) {
+    return allocLocal(t).offset;
 }
 
 VarInfo TypeChecker::makeVarInfo(const Type& t, bool global, const string& name) {
@@ -336,11 +471,250 @@ VarInfo TypeChecker::makeVarInfo(const Type& t, bool global, const string& name)
     info.align = alignOf(t);
     info.storage = Storage::GLOBAL;
     info.label = "g_" + name;
-    collectStringOffsets(t, info.stringOffsets);
     return info;
 }
 
+// Clasificacion ABI de records (System V AMD64, seccion 3.2.3)
+
+void TypeChecker::flattenAbi(const Type& t, int off, AbiClass cls[2], bool& bad) {
+    if (t.isArray()) {
+        Type et = t.elementType();
+        int esz = sizeOf(et);
+        for (int i = 0; i < t.arrayDims[0]; i++) {
+            flattenAbi(et, off + i * esz, cls, bad);
+            if (bad) return;
+        }
+        return;
+    }
+    if (t.kind == Type::RECORD && t.ptrLevel == 0 && !t.isRef) {
+        RecordLayout* L = layoutOf(t);
+        if (!L) return;
+        for (const FieldInfo& f : L->fields) {
+            flattenAbi(f.type, off + f.offset, cls, bad);
+            if (bad) return;
+        }
+        return;
+    }
+    int eb = off / 8;
+    if (eb > 1) {
+        bad = true;
+        return;
+    }
+    AbiClass c = AbiClass::INTEGER;
+    if (!t.isRef && t.ptrLevel == 0 && (t.kind == Type::FLOAT || t.kind == Type::DOUBLE)) c = AbiClass::SSE;
+    if (cls[eb] == AbiClass::NO_CLASS) cls[eb] = c;
+    else if (cls[eb] == AbiClass::INTEGER || c == AbiClass::INTEGER) cls[eb] = AbiClass::INTEGER;
+}
+
+void TypeChecker::classifyRecord(RecordDecl* rd) {
+    RecordLayout& L = rd->layout;
+    RecordAbi& A = L.abi;
+    A = RecordAbi();
+    A.trivialForCalls = L.copyTrivial && L.dtorTrivial;
+    A.empty = L.fields.empty();
+    if (!A.trivialForCalls || A.empty) return;
+    if (L.size > 16) {
+        A.memory = true;
+        return;
+    }
+    AbiClass cls[2] = {AbiClass::NO_CLASS, AbiClass::NO_CLASS};
+    bool bad = false;
+    for (const FieldInfo& f : L.fields) {
+        flattenAbi(f.type, f.offset, cls, bad);
+        if (bad) break;
+    }
+    if (bad) {
+        A.memory = true;
+        return;
+    }
+    A.neight = (L.size + 7) / 8;
+    for (int i = 0; i < A.neight; i++) {
+        A.cls[i] = (cls[i] == AbiClass::NO_CLASS) ? AbiClass::INTEGER : cls[i];
+    }
+}
+
 // Declaraciones de records y funciones (primer pase, en orden fuente)
+
+FunDecl* TypeChecker::makeImplicit(RecordDecl* rd, FunKind kind, bool copyParam) {
+    vector<Param*> ps;
+    if (copyParam) {
+        Type pt = Type::makeRecord(rd->name);
+        pt.constBits |= 1u;
+        ps.push_back(new Param(pt, "other", 0, true, {}, rd->line, rd->col));
+    }
+    Type rt = Type(Type::VOID);
+    string name = rd->name;
+    if (kind == FunKind::DTOR) name = "~" + rd->name;
+    if (kind == FunKind::COPY_ASSIGN) {
+        name = "operator=";
+        rt = Type::makeRecord(rd->name, 0, true);
+    }
+    FunDecl* fd = new FunDecl(rt, name, ps, new BlockStmt(rd->line, rd->col), rd->line, rd->col);
+    fd->funKind = kind;
+    fd->isImplicit = true;
+    rd->implicitFuns.push_back(fd);
+    return fd;
+}
+
+bool TypeChecker::isCopyCtorSig(const FunDecl* fd, const RecordDecl* rd) const {
+    if (fd->params.size() != 1) return false;
+    const Param* p = fd->params[0];
+    return p->isRef && p->ptrCount == 0 && p->arrayDims.empty() &&
+           p->type.kind == Type::RECORD && p->type.recordName == rd->name;
+}
+
+void TypeChecker::analyzeSpecialMembers(RecordDecl* rd) {
+    RecordLayout& L = rd->layout;
+    FunDecl *uDefault = nullptr, *uParam = nullptr, *uCopy = nullptr, *uDtor = nullptr, *uAssign = nullptr;
+    bool anyCtor = false;
+
+    for (RecordMember* m : rd->members) {
+        if (!m->funDecl) continue;
+        FunDecl* fd = m->funDecl;
+        fd->isPrivate = (m->access == ACCESS_PRIVATE);
+        switch (fd->funKind) {
+            case FunKind::CTOR:
+                anyCtor = true;
+                if (fd->params.empty()) {
+                    if (uDefault) addError("Constructor por defecto duplicado en '" + rd->name + "'", fd->line, fd->col);
+                    else uDefault = fd;
+                } else if (isCopyCtorSig(fd, rd)) {
+                    if (uCopy) addError("Constructor de copia duplicado en '" + rd->name + "'", fd->line, fd->col);
+                    else uCopy = fd;
+                } else {
+                    const Param* p0 = fd->params[0];
+                    if (fd->params.size() == 1 && p0->type.kind == Type::RECORD && p0->type.recordName == rd->name &&
+                        p0->ptrCount == 0 && !p0->isRef) {
+                        addError("El constructor de copia debe recibir una referencia: " + rd->name + "(const " +
+                                 rd->name + "&)", fd->line, fd->col);
+                    } else if (uParam) {
+                        addError("Solo se permite un constructor con parámetros en '" + rd->name +
+                                 "' (además del constructor por defecto y el de copia)", fd->line, fd->col);
+                    } else {
+                        uParam = fd;
+                    }
+                }
+                break;
+            case FunKind::DTOR:
+                if (uDtor) addError("Solo se permite un destructor en '" + rd->name + "'", fd->line, fd->col);
+                else uDtor = fd;
+                break;
+            case FunKind::COPY_ASSIGN: {
+                bool okRet = fd->returnType.kind == Type::RECORD && fd->returnType.recordName == rd->name &&
+                             fd->returnType.ptrLevel == 0 && fd->returnType.isRef;
+                bool okPar = fd->params.size() == 1 && fd->params[0]->isRef && fd->params[0]->ptrCount == 0 &&
+                             fd->params[0]->type.kind == Type::RECORD && fd->params[0]->type.recordName == rd->name &&
+                             (fd->params[0]->type.constBits & 1u);
+                if (!okRet || !okPar) {
+                    addError("La asignación de copia debe declararse como '" + rd->name + "& operator=(const " +
+                             rd->name + "& otra)'", fd->line, fd->col);
+                } else if (uAssign) {
+                    addError("Asignación de copia duplicada en '" + rd->name + "'", fd->line, fd->col);
+                } else {
+                    uAssign = fd;
+                }
+                break;
+            }
+            case FunKind::NORMAL:
+                if (fd->name == rd->name) {
+                    addError("Un método no puede llamarse como la clase: '" + fd->name + "'", fd->line, fd->col);
+                }
+                break;
+        }
+    }
+
+    bool fDtorNT = false, fCopyNT = false, fAssignNT = false, fDefaultNT = false;
+    bool fDefaultDel = false, fCopyDel = false, fAssignDel = false;
+    bool anyPrivate = false;
+    for (const FieldInfo& f : L.fields) {
+        Type et = f.type;
+        et.arrayDims.clear();
+        if (f.isPrivate) anyPrivate = true;
+        if (!dtorTrivial(et)) fDtorNT = true;
+        if (!copyTrivial(et)) fCopyNT = true;
+        if (!assignTrivial(et)) fAssignNT = true;
+
+        if (f.classInit) {
+            fDefaultNT = true;
+        } else if (f.type.isRef) {
+            fDefaultDel = true;
+        } else if (f.type.isConstObj() && !isClassObj(et)) {
+            fDefaultDel = true;
+        } else if (isClassObj(et)) {
+            if (!defaultTrivial(et)) fDefaultNT = true;
+            RecordLayout* fl = layoutOf(et);
+            if (fl && fl->defaultCtorAvail != Avail::USER && fl->defaultCtorAvail != Avail::IMPLICIT) fDefaultDel = true;
+        }
+        if (f.type.isRef || f.type.isConstObj()) fAssignDel = true;
+        if (RecordLayout* fl = layoutOf(et)) {
+            if (isClassObj(et)) {
+                if (fl->copyCtorAvail == Avail::DELETED) fCopyDel = true;
+                if (fl->copyAssignAvail == Avail::DELETED) fAssignDel = true;
+            }
+        }
+    }
+
+    // constructor por defecto
+    if (uDefault) {
+        L.defaultCtorAvail = Avail::USER;
+        L.defaultCtor = uDefault;
+        L.defaultTrivial = false;
+    } else if (!anyCtor) {
+        if (fDefaultDel) {
+            L.defaultCtorAvail = Avail::DELETED;
+            L.defaultTrivial = false;
+        } else {
+            L.defaultCtorAvail = Avail::IMPLICIT;
+            L.defaultTrivial = !fDefaultNT;
+        }
+    } else {
+        L.defaultCtorAvail = Avail::NONE;
+        L.defaultTrivial = false;
+    }
+
+    // constructor con parametros
+    L.paramCtorAvail = uParam ? Avail::USER : Avail::NONE;
+    L.paramCtor = uParam;
+
+    // constructor de copia
+    if (uCopy) {
+        L.copyCtorAvail = Avail::USER;
+        L.copyCtor = uCopy;
+        L.copyTrivial = false;
+    } else {
+        L.copyCtorAvail = fCopyDel ? Avail::DELETED : Avail::IMPLICIT;
+        L.copyTrivial = !fCopyNT;
+    }
+
+    // asignacion de copia
+    if (uAssign) {
+        L.copyAssignAvail = Avail::USER;
+        L.copyAssign = uAssign;
+        L.assignTrivial = false;
+    } else {
+        L.copyAssignAvail = fAssignDel ? Avail::DELETED : Avail::IMPLICIT;
+        L.assignTrivial = !fAssignNT;
+    }
+
+    // destructor
+    if (uDtor) {
+        L.dtorAvail = Avail::USER;
+        L.dtor = uDtor;
+        L.dtorTrivial = false;
+    } else {
+        L.dtorAvail = Avail::IMPLICIT;
+        L.dtorTrivial = !fDtorNT;
+    }
+
+    L.isAggregate = !anyCtor && !anyPrivate;
+
+    if (L.defaultCtorAvail == Avail::IMPLICIT && !L.defaultTrivial) L.defaultCtor = makeImplicit(rd, FunKind::CTOR, false);
+    if (L.copyCtorAvail == Avail::IMPLICIT && !L.copyTrivial) L.copyCtor = makeImplicit(rd, FunKind::CTOR, true);
+    if (L.copyAssignAvail == Avail::IMPLICIT && !L.assignTrivial) L.copyAssign = makeImplicit(rd, FunKind::COPY_ASSIGN, true);
+    if (L.dtorAvail == Avail::IMPLICIT && !L.dtorTrivial) L.dtor = makeImplicit(rd, FunKind::DTOR, false);
+
+    classifyRecord(rd);
+}
 
 void TypeChecker::declareRecord(RecordDecl* rd) {
     if (records.count(rd->name)) {
@@ -348,6 +722,9 @@ void TypeChecker::declareRecord(RecordDecl* rd) {
         return;
     }
     records[rd->name] = rd;
+    for (FunDecl* f : rd->implicitFuns) delete f;
+    rd->implicitFuns.clear();
+    rd->layout = RecordLayout();
     RecordLayout& L = rd->layout;
     L.name = rd->name;
     L.complete = false;
@@ -357,7 +734,8 @@ void TypeChecker::declareRecord(RecordDecl* rd) {
     for (RecordMember* m : rd->members) {
         if (!m->varDecl) continue;
         for (VarInit* vi : m->varDecl->inits) {
-            Type t = declaredType(m->varDecl->baseType, vi->ptrCount, vi->isRef, vi->arrayDims, vi->line, vi->col);
+            Type t = declaredType(m->varDecl->baseType, vi->ptrCount, vi->isRef, vi->ptrConst, vi->arrayDims,
+                                  vi->line, vi->col);
             if (t.isError()) continue;
             if (L.findField(vi->name)) {
                 addError("Campo duplicado: '" + vi->name + "'", vi->line, vi->col);
@@ -367,23 +745,27 @@ void TypeChecker::declareRecord(RecordDecl* rd) {
                 addError("Un campo no puede ser de tipo void: '" + vi->name + "'", vi->line, vi->col);
                 continue;
             }
-            if (t.isRef) {
-                addError("Campos de tipo referencia no soportados (no hay constructores): '" + vi->name + "'", vi->line, vi->col);
+            if (t.isRef && t.isArray()) {
+                addError("Arreglo de referencias no permitido: '" + vi->name + "'", vi->line, vi->col);
                 continue;
             }
-            if (vi->initializer) {
-                addError("Inicializadores de campo no soportados (no hay constructores): '" + vi->name + "'", vi->line, vi->col);
-                continue;
-            }
-            if (t.kind == Type::RECORD && t.ptrLevel == 0) {
+            if (t.kind == Type::RECORD && t.ptrLevel == 0 && !t.isRef) {
                 if (!records[t.recordName]->layout.complete) {
                     addError("El tipo '" + t.recordName + "' es incompleto como campo por valor", vi->line, vi->col);
                     continue;
                 }
             }
-            if (t.isArray() && hasStrings(t)) {
-                addError("Arreglos de string o de records con string no soportados: '" + vi->name + "'", vi->line, vi->col);
-                continue;
+            if (vi->initializer) {
+                if (t.isRef) {
+                    addError("Inicializador en la clase para una referencia no soportado: '" + vi->name + "'",
+                             vi->line, vi->col);
+                    continue;
+                }
+                if (!isConstantInit(vi->initializer)) {
+                    addError("El inicializador de campo '" + vi->name +
+                             "' debe ser una expresión constante (limitación del subconjunto)", vi->line, vi->col);
+                    continue;
+                }
             }
             FieldInfo f;
             f.name = vi->name;
@@ -391,14 +773,14 @@ void TypeChecker::declareRecord(RecordDecl* rd) {
             f.size = sizeOf(t);
             f.align = alignOf(t);
             f.isPrivate = (m->access == ACCESS_PRIVATE);
+            f.classInit = vi->initializer;
+            f.line = vi->line;
+            f.col = vi->col;
             offset = alignUp(offset, f.align);
             f.offset = offset;
             offset += f.size;
             if (f.align > maxAlign) maxAlign = f.align;
-
-            vector<int> so;
-            collectStringOffsets(t, so);
-            for (int o : so) L.stringOffsets.push_back(f.offset + o);
+            if (hasStringIn(t)) L.hasString = true;
             L.fields.push_back(f);
         }
     }
@@ -406,27 +788,52 @@ void TypeChecker::declareRecord(RecordDecl* rd) {
     L.size = alignUp(offset > 0 ? offset : 1, maxAlign);
     L.complete = true;
 
+    // los inicializadores constantes se verifican una sola vez, fuera de cualquier funcion
+    int savedFrame = frameUsed;
+    frameUsed = 0;
+    for (FieldInfo& f : L.fields) {
+        if (f.classInit) checkInitializer(f.type, f.classInit, f.line, f.col);
+    }
+    frameUsed = savedFrame;
+
+    analyzeSpecialMembers(rd);
+
     for (RecordMember* m : rd->members) {
         if (!m->funDecl) continue;
         declareFunction(m->funDecl, rd);
+    }
+    for (FunDecl* f : rd->implicitFuns) {
+        declareFunction(f, rd);
     }
 }
 
 void TypeChecker::declareFunction(FunDecl* fd, RecordDecl* owner) {
     FunctionLayout& L = fd->layout;
+    L = FunctionLayout();
     L.isMethod = (owner != nullptr);
     L.ownerRecord = owner ? owner->name : "";
     if (owner) {
-        L.label = "m_" + owner->name + "_" + fd->name;
+        switch (fd->funKind) {
+            case FunKind::CTOR:
+                if (fd->params.empty()) L.label = "ctor_" + owner->name + "_default";
+                else if (isCopyCtorSig(fd, owner)) L.label = "ctor_" + owner->name + "_copy";
+                else L.label = "ctor_" + owner->name + "_args";
+                break;
+            case FunKind::DTOR:        L.label = "dtor_" + owner->name; break;
+            case FunKind::COPY_ASSIGN: L.label = "assign_" + owner->name; break;
+            default:                   L.label = "m_" + owner->name + "_" + fd->name; break;
+        }
     } else {
         L.label = (fd->name == "main") ? "main" : "f_" + fd->name;
     }
 
-    Type rt = resolveType(fd->returnType, fd->line, fd->col);
-    if (!rt.isError()) {
-        if (!rt.isRef && rt.ptrLevel == 0 && (rt.kind == Type::RECORD || rt.kind == Type::STRING)) {
-            addError("Retorno de '" + rt.toString() + "' por valor no soportado en '" + fd->name +
-                     "' (use puntero o referencia)", fd->line, fd->col);
+    Type rt;
+    if (fd->funKind == FunKind::CTOR || fd->funKind == FunKind::DTOR) {
+        rt = Type(Type::VOID);
+    } else {
+        rt = resolveType(fd->returnType, fd->line, fd->col);
+        if (!rt.isError() && rt.isRef && rt.isArray()) {
+            addError("Retorno de arreglo no permitido en '" + fd->name + "'", fd->line, fd->col);
         }
     }
     L.returnType = rt;
@@ -434,6 +841,7 @@ void TypeChecker::declareFunction(FunDecl* fd, RecordDecl* owner) {
     if (owner) {
         VarInfo thisInfo;
         thisInfo.type = Type::makeRecord(owner->name, 1);
+        if (fd->isConst && fd->funKind == FunKind::NORMAL) thisInfo.type.constBits |= 1u;
         L.params.push_back(thisInfo);
     }
 
@@ -442,6 +850,7 @@ void TypeChecker::declareFunction(FunDecl* fd, RecordDecl* owner) {
         t.ptrLevel = p->ptrCount;
         t.isRef = p->isRef;
         t.arrayDims.clear();
+        t.constBits = (p->type.constBits & 1u) | p->ptrConst;
         t = resolveType(t, p->line, p->col);
         if (!t.isError()) {
             if (p->arrayDims.size() > 1) {
@@ -455,10 +864,6 @@ void TypeChecker::declareFunction(FunDecl* fd, RecordDecl* owner) {
             if (t.kind == Type::VOID && t.ptrLevel == 0 && !t.isRef) {
                 addError("Parámetro de tipo void: '" + p->name + "'", p->line, p->col);
                 t = Type::makeError();
-            } else if (!t.isRef && t.ptrLevel == 0 && (t.kind == Type::RECORD || t.kind == Type::STRING)) {
-                addError("Paso de '" + t.toString() + "' por valor no soportado en el parámetro '" + p->name +
-                         "' (use puntero o referencia)", p->line, p->col);
-                t = Type::makeError();
             }
         }
         VarInfo vi;
@@ -466,19 +871,20 @@ void TypeChecker::declareFunction(FunDecl* fd, RecordDecl* owner) {
         L.params.push_back(vi);
     }
 
+    computeAbi(fd);
+
     if (owner) {
-        RecordLayout& RL = owner->layout;
-        if (RL.methods.count(fd->name) || RL.findField(fd->name)) {
-            addError("Redefinición del miembro '" + fd->name + "' en '" + owner->name + "'", fd->line, fd->col);
-            return;
+        if (fd->funKind == FunKind::NORMAL) {
+            RecordLayout& RL = owner->layout;
+            if (RL.methods.count(fd->name) || RL.findField(fd->name)) {
+                addError("Redefinición del miembro '" + fd->name + "' en '" + owner->name + "'", fd->line, fd->col);
+                return;
+            }
+            MethodInfo mi;
+            mi.fun = fd;
+            mi.isPrivate = fd->isPrivate;
+            RL.methods[fd->name] = mi;
         }
-        MethodInfo mi;
-        mi.fun = fd;
-        mi.isPrivate = false;
-        for (RecordMember* m : owner->members) {
-            if (m->funDecl == fd) mi.isPrivate = (m->access == ACCESS_PRIVATE);
-        }
-        RL.methods[fd->name] = mi;
     } else {
         if (functions.count(fd->name)) {
             addError("Redefinición de la función '" + fd->name + "'", fd->line, fd->col);
@@ -486,6 +892,119 @@ void TypeChecker::declareFunction(FunDecl* fd, RecordDecl* owner) {
             functions[fd->name] = fd;
         }
     }
+}
+
+// Asigna registros y pila a cada parametro y al retorno segun System V AMD64
+void TypeChecker::computeAbi(FunDecl* fd) {
+    FunctionLayout& L = fd->layout;
+    int ni = 0, ns = 0, stack = 0;
+
+    AbiLoc ra;
+    const Type& rt = L.returnType;
+    if (rt.isError() || rt.isVoid()) {
+        ra.pass = Pass::VOID_RET;
+    } else if (!rt.isRef && isByValueClass(rt)) {
+        const RecordAbi& ab = abiOf(rt);
+        ra.size = sizeOf(rt);
+        if (ab.empty && rt.kind == Type::RECORD) {
+            ra.pass = Pass::EMPTY;
+        } else if (!ab.trivialForCalls || ab.memory) {
+            ra.pass = Pass::HIDDEN_PTR;
+            ni = 1;
+        } else {
+            ra.pass = Pass::AGG_REGS;
+            ra.neight = ab.neight;
+            int ri = 0, rs = 0;
+            for (int i = 0; i < ab.neight; i++) {
+                ra.cls[i] = ab.cls[i];
+                ra.reg[i] = (ab.cls[i] == AbiClass::SSE) ? rs++ : ri++;
+            }
+        }
+    } else if (!rt.isRef && rt.ptrLevel == 0 && rt.arrayDims.empty() &&
+               (rt.kind == Type::FLOAT || rt.kind == Type::DOUBLE)) {
+        ra.pass = Pass::SSE_REG;
+    } else {
+        ra.pass = Pass::INT_REG;
+    }
+    L.retAbi = ra;
+
+    L.paramAbi.assign(L.params.size(), AbiLoc());
+    for (size_t i = 0; i < L.params.size(); i++) {
+        const Type& pt = L.params[i].type;
+        AbiLoc a;
+        a.size = pt.isError() ? 8 : sizeOf(pt);
+        bool isSse = !pt.isError() && !pt.isRef && pt.ptrLevel == 0 && pt.arrayDims.empty() &&
+                     (pt.kind == Type::FLOAT || pt.kind == Type::DOUBLE);
+        bool byValueClass = !pt.isError() && !pt.isRef && isByValueClass(pt);
+
+        if (byValueClass) {
+            const RecordAbi& ab = abiOf(pt);
+            if (ab.empty && pt.kind == Type::RECORD) {
+                a.pass = Pass::EMPTY;
+                L.paramAbi[i] = a;
+                continue;
+            }
+            if (!ab.trivialForCalls) {
+                a.pass = Pass::INVISIBLE_REF;
+                a.size = 8;
+                isSse = false;
+            } else if (ab.memory) {
+                a.pass = Pass::STACK;
+                a.stackBytes = alignUp(a.size, 8);
+                a.stackOffset = stack;
+                stack += a.stackBytes;
+                L.paramAbi[i] = a;
+                continue;
+            } else {
+                int needI = 0, needS = 0;
+                for (int k = 0; k < ab.neight; k++) {
+                    if (ab.cls[k] == AbiClass::SSE) needS++;
+                    else needI++;
+                }
+                if (ni + needI <= 6 && ns + needS <= 8) {
+                    a.pass = Pass::AGG_REGS;
+                    a.neight = ab.neight;
+                    for (int k = 0; k < ab.neight; k++) {
+                        a.cls[k] = ab.cls[k];
+                        a.reg[k] = (ab.cls[k] == AbiClass::SSE) ? ns++ : ni++;
+                    }
+                } else {
+                    a.pass = Pass::STACK;
+                    a.stackBytes = alignUp(a.size, 8);
+                    a.stackOffset = stack;
+                    stack += a.stackBytes;
+                }
+                L.paramAbi[i] = a;
+                continue;
+            }
+        }
+
+        if (isSse) {
+            if (ns < 8) {
+                a.pass = Pass::SSE_REG;
+                a.reg[0] = ns++;
+            } else {
+                a.pass = Pass::STACK;
+                a.stackBytes = 8;
+                a.stackOffset = stack;
+                stack += 8;
+            }
+        } else {
+            if (a.pass != Pass::INVISIBLE_REF) a.pass = Pass::INT_REG;
+            if (ni < 6) {
+                a.reg[0] = ni++;
+            } else {
+                // sin registro: el escalar o el puntero oculto viaja en la pila
+                if (a.pass != Pass::INVISIBLE_REF) a.pass = Pass::STACK;
+                a.reg[0] = -1;
+                a.stackBytes = 8;
+                a.stackOffset = stack;
+                stack += 8;
+            }
+        }
+        L.paramAbi[i] = a;
+    }
+    L.stackArgBytes = stack;
 }
 
 // Expresiones
@@ -540,12 +1059,12 @@ Type TypeChecker::visit(BinaryExp* exp) {
                 if (l.isPointer() && r.isIntegral()) {
                     exp->mode = (exp->op == PLUS_OP) ? BM_PTR_PLUS_INT : BM_PTR_MINUS_INT;
                     exp->ptrScale = pointeeSize(l, exp->line, exp->col);
-                    return annotate(exp, l);
+                    return annotate(exp, l.withoutConst());
                 }
                 if (exp->op == PLUS_OP && l.isIntegral() && r.isPointer()) {
                     exp->mode = BM_INT_PLUS_PTR;
                     exp->ptrScale = pointeeSize(r, exp->line, exp->col);
-                    return annotate(exp, r);
+                    return annotate(exp, r.withoutConst());
                 }
                 if (exp->op == MINUS_OP && l.isPointer() && r.isPointer() && l.sameBase(r)) {
                     exp->mode = BM_PTR_DIFF;
@@ -653,7 +1172,7 @@ Type TypeChecker::visit(UnaryExp* exp) {
                 return annotate(exp, Type::makeError());
             }
             if (t.isBool() || t.isChar()) t = makeType(Type::INT);
-            return annotate(exp, t);
+            return annotate(exp, t.withoutConst());
 
         case NOT_UNARY:
             if (!boolConvertible(t)) {
@@ -675,9 +1194,7 @@ Type TypeChecker::visit(UnaryExp* exp) {
                 return annotate(exp, Type::makeError());
             }
             pointeeSize(t, exp->line, exp->col);
-            Type res = t;
-            res.ptrLevel--;
-            return annotate(exp, res, true);
+            return annotate(exp, t.pointee(), true);
         }
 
         case ADDR_UNARY: {
@@ -685,15 +1202,18 @@ Type TypeChecker::visit(UnaryExp* exp) {
                 addError("El operador '&' requiere una variable o elemento (lvalue)", exp->line, exp->col);
                 return annotate(exp, Type::makeError());
             }
-            Type res = t0.withoutRef();
-            res.ptrLevel++;
-            return annotate(exp, res);
+            return annotate(exp, t0.withoutRef().addressOf());
         }
 
         case PRE_INC_UNARY:
         case PRE_DEC_UNARY:
             if (!exp->exp->isLValue || t0.isArray() || (!t.isNumeric() && !t.isPointer()) || t.isBool()) {
                 addError("Operador '++ / --' requiere un lvalue numérico (no bool) o puntero", exp->line, exp->col);
+                return annotate(exp, Type::makeError());
+            }
+            if (t0.isConstObj()) {
+                addError("No se puede modificar un objeto const con '++ / --' (tipo '" + t0.toString() + "')",
+                         exp->line, exp->col);
                 return annotate(exp, Type::makeError());
             }
             if (t.isPointer()) exp->ptrScale = pointeeSize(t, exp->line, exp->col);
@@ -715,12 +1235,31 @@ Type TypeChecker::visit(AssignExp* exp) {
         addError("No se puede asignar a un arreglo completo", exp->line, exp->col);
         return annotate(exp, Type::makeError());
     }
+    if (lt.isConstObj()) {
+        addError("No se puede asignar a un objeto const (tipo '" + lt.toString() + "')", exp->line, exp->col);
+        return annotate(exp, Type::makeError());
+    }
+    if (lt.isRecord()) {
+        Type vt = rt.withoutRef();
+        if (!vt.isRecord() || vt.recordName != lt.recordName) {
+            addError("No se puede asignar un valor de tipo '" + rt.toString() +
+                     "' a una variable de tipo '" + lt.toString() + "'", exp->line, exp->col);
+            return annotate(exp, Type::makeError());
+        }
+        RecordLayout* L = layoutOf(lt);
+        if (L->copyAssignAvail == Avail::DELETED) {
+            addError("La asignación de copia de '" + lt.recordName +
+                     "' no está disponible (tiene campos const o referencias)", exp->line, exp->col);
+            return annotate(exp, Type::makeError());
+        }
+        return annotate(exp, lt.withoutRef(), true);
+    }
     if (!assignable(lt, exp->value)) {
         addError("No se puede asignar un valor de tipo '" + rt.toString() +
                  "' a una variable de tipo '" + lt.toString() + "'", exp->line, exp->col);
         return annotate(exp, Type::makeError());
     }
-    return annotate(exp, lt.withoutRef());
+    return annotate(exp, lt.withoutRef().withoutConst());
 }
 
 Type TypeChecker::visit(NumberExp* exp) {
@@ -740,7 +1279,9 @@ Type TypeChecker::visit(CharExp* exp) {
 }
 
 Type TypeChecker::visit(StringExp* exp) {
-    return annotate(exp, makeType(Type::CHAR, 1));
+    Type t = makeType(Type::CHAR, 1);
+    t.constBits |= 1u;   // un literal es const char*
+    return annotate(exp, t);
 }
 
 Type TypeChecker::visit(NullptrExp* exp) {
@@ -754,8 +1295,14 @@ Type TypeChecker::visit(IdExp* exp) {
     if (exp->parts.size() == 1 && env.lookup(exp->parts[0], vi)) {
         exp->var = vi;
         exp->idKind = (vi.storage == Storage::FIELD) ? ID_FIELD : ID_VAR;
-        exp->isRefVar = vi.type.isRef;
-        return annotate(exp, vi.type.withoutRef(), true);
+        exp->isRefVar = vi.type.isRef || vi.indirect;
+        Type t = vi.type.withoutRef();
+        // en un metodo const los campos propios son const (la referencia no propaga const)
+        if (vi.storage == Storage::FIELD && !vi.type.isRef && currentFunction && currentFunction->isConst &&
+            currentFunction->funKind == FunKind::NORMAL) {
+            t = t.withTopConst();
+        }
+        return annotate(exp, t, true);
     }
 
     const string& last = exp->parts.back();
@@ -818,45 +1365,203 @@ Type TypeChecker::checkMemberAccess(PostfixExp* exp) {
         return annotate(exp, Type::makeError());
     }
     exp->fieldOffset = f->offset;
-    return annotate(exp, f->type, true);
+    exp->fieldIsRef = f->type.isRef;
+    Type ft = f->type.withoutRef();
+    if (rec.constAt(0) && !f->type.isRef) ft = ft.withTopConst();
+    return annotate(exp, ft, true);
 }
 
 Type TypeChecker::callResult(PostfixExp* call, FunDecl* fd) {
     Type rt = fd->layout.returnType;
     if (rt.isError()) return annotate(call, rt);
+    if (!rt.isRef && isByValueClass(rt)) {
+        call->retTemp = allocTemp(rt.withoutConst());
+    }
     return annotate(call, rt.withoutRef(), rt.isRef);
 }
 
-void TypeChecker::checkArgs(PostfixExp* call, FunDecl* fd, const string& name) {
-    size_t off = fd->layout.isMethod ? 1 : 0;
-    size_t np = fd->layout.params.size() - off;
+// Enlace de una referencia a un inicializador. Reglas de C++: un lvalue del mismo tipo sin
+// perder const, o un valor temporal solo si la referencia es a const.
+bool TypeChecker::bindRefInit(const Type& refType, Exp* init, InitSpec& sp, int line, int col, bool evaluate,
+                              const string& what) {
+    Type it0 = evaluate ? init->accept(this) : init->inferredType;
+    if (it0.isError()) return false;
+    Type tb = refType.withoutRef();
+    Type ib = it0.withoutRef();
+    sp.kind = IK_REF;
+    sp.expr = init;
+    sp.tempOffset = 0;
+    bool sameB = ib.sameBase(tb) && !ib.isArray();
 
-    for (Exp* a : call->args) a->accept(this);
-
-    if (call->args.size() != np) {
-        addError("La función '" + name + "' espera " + to_string(np) +
-                 " argumentos, pero recibió " + to_string(call->args.size()), call->line, call->col);
-        return;
+    if (init->isLValue && sameB) {
+        if (refBindable(tb, ib)) return true;
+        addError("No se puede enlazar " + what + " '" + refType.toString() + "' con un objeto de tipo '" +
+                 ib.toString() + "' (se perdería const)", line, col);
+        return false;
     }
-    for (size_t i = 0; i < np; i++) {
-        Exp* a = call->args[i];
-        Type pt = fd->layout.params[i + off].type;
-        Type at = a->inferredType;
-        if (pt.isError() || at.isError()) continue;
-        if (pt.isRef) {
-            if (!a->isLValue || !at.withoutRef().sameBase(pt) || at.isArray()) {
-                addError("Argumento " + to_string(i + 1) + " de '" + name + "' debe ser una variable de tipo '" +
-                         pt.withoutRef().toString() + "' (parámetro por referencia)", call->line, call->col);
+    if (tb.isConstObj()) {
+        if (tb.isRecord()) {
+            if (sameB && !init->isLValue) return true;
+        } else if (tb.isString()) {
+            if (ib.isString() && !init->isLValue) return true;
+            Type d = decay(ib);
+            if (d.kind == Type::CHAR && d.ptrLevel == 1) {
+                sp.tempOffset = allocTemp(Type(Type::STRING));
+                return true;
             }
-        } else if (!assignable(pt, a)) {
-            addError("Argumento " + to_string(i + 1) + " de '" + name + "' tiene tipo '" +
-                     at.toString() + "', pero se esperaba '" + pt.toString() + "'", call->line, call->col);
+        } else if (assignable(tb, init)) {
+            sp.tempOffset = allocTemp(tb.withoutConst());
+            return true;
         }
     }
+    addError("No se puede enlazar " + what + " '" + refType.toString() + "' con un valor de tipo '" +
+             it0.toString() + "'" + (init->isLValue ? "" : " (solo una referencia a const admite temporales)"),
+             line, col);
+    return false;
+}
+
+bool TypeChecker::checkArgList(vector<Exp*>& args, vector<ArgInfo>& info, const vector<VarInfo>& params,
+                               size_t offset, const string& name, int line, int col, bool evaluate) {
+    info.clear();
+    size_t np = params.size() - offset;
+
+    if (evaluate) {
+        for (Exp* a : args) a->accept(this);
+    }
+    if (args.size() != np) {
+        addError("La función '" + name + "' espera " + to_string(np) +
+                 " argumentos, pero recibió " + to_string(args.size()), line, col);
+        return false;
+    }
+    bool ok = true;
+    for (size_t i = 0; i < np; i++) {
+        Exp* a = args[i];
+        Type pt = params[i + offset].type;
+        Type at = a->inferredType;
+        ArgInfo ai;
+        ai.ptype = pt;
+        if (pt.isError() || at.isError()) {
+            info.push_back(ai);
+            continue;
+        }
+        string what = "Argumento " + to_string(i + 1) + " de '" + name + "'";
+
+        if (pt.isRef) {
+            InitSpec sp;
+            if (bindRefInit(pt, a, sp, line, col, false, "el parámetro por referencia " + to_string(i + 1) + " de '" + name + "'")) {
+                if (sp.tempOffset != 0) {
+                    ai.mode = AM_REF_TEMP;
+                    ai.tempOffset = sp.tempOffset;
+                } else {
+                    ai.mode = AM_REF;
+                }
+            } else {
+                ok = false;
+            }
+        } else if (isByValueClass(pt) && pt.kind == Type::RECORD) {
+            Type ab = at.withoutRef();
+            if (!ab.isRecord() || ab.recordName != pt.recordName) {
+                addError(what + " tiene tipo '" + at.toString() + "', pero se esperaba '" + pt.toString() + "'",
+                         line, col);
+                ok = false;
+            } else if (layoutOf(pt)->copyCtorAvail == Avail::DELETED) {
+                addError(what + ": el constructor de copia de '" + pt.recordName + "' no está disponible", line, col);
+                ok = false;
+            } else if (abiOf(pt).trivialForCalls) {
+                ai.mode = AM_AGG;
+            } else {
+                ai.mode = AM_COPY;
+                ai.tempOffset = allocTemp(pt.withoutConst());
+            }
+        } else if (isByValueClass(pt) && pt.kind == Type::STRING) {
+            if (!assignable(pt, a)) {
+                addError(what + " tiene tipo '" + at.toString() + "', pero se esperaba '" + pt.toString() + "'",
+                         line, col);
+                ok = false;
+            } else {
+                ai.mode = AM_COPY;
+                ai.tempOffset = allocTemp(Type(Type::STRING));
+            }
+        } else if (!assignable(pt, a)) {
+            addError(what + " tiene tipo '" + at.toString() + "', pero se esperaba '" + pt.toString() + "'",
+                     line, col);
+            ok = false;
+        }
+        info.push_back(ai);
+    }
+    return ok;
+}
+
+// Elige el constructor para T(args): por defecto, de copia o con parametros
+bool TypeChecker::resolveCtorCall(const Type& rec, vector<Exp*>& args, vector<ArgInfo>& info, InitSpec& spec,
+                                  int line, int col, bool argsEvaluated) {
+    if (!argsEvaluated) {
+        for (Exp* a : args) a->accept(this);
+    }
+    spec = InitSpec();
+    info.clear();
+    for (Exp* a : args) {
+        if (a->inferredType.isError()) return false;
+    }
+    RecordLayout* L = layoutOf(rec);
+    if (!L) return false;
+    const string& nm = rec.recordName;
+    RecordDecl* rd = records[nm];
+
+    auto checkAccess = [&](FunDecl* c) {
+        if (c && c->isPrivate && (!currentRecord || currentRecord->name != nm)) {
+            addError("El constructor de '" + nm + "' es privado", line, col);
+            return false;
+        }
+        return true;
+    };
+
+    if (args.empty()) {
+        if (L->defaultCtorAvail == Avail::USER || L->defaultCtorAvail == Avail::IMPLICIT) {
+            spec.kind = IK_DEFAULT;
+            spec.ctor = L->defaultCtor;
+            return checkAccess(L->defaultCtor);
+        }
+        if (L->defaultCtorAvail == Avail::DELETED) {
+            addError("El constructor por defecto de '" + nm +
+                     "' no está disponible (hay campos que no se pueden inicializar por defecto)", line, col);
+        } else {
+            addError("'" + nm + "' no tiene constructor por defecto", line, col);
+        }
+        return false;
+    }
+
+    Type a0 = args[0]->inferredType.withoutRef();
+    if (args.size() == 1 && a0.isRecord() && a0.recordName == nm) {
+        if (L->copyCtorAvail == Avail::DELETED) {
+            addError("El constructor de copia de '" + nm + "' no está disponible", line, col);
+            return false;
+        }
+        spec.kind = IK_COPY;
+        spec.expr = args[0];
+        spec.ctor = L->copyCtor;
+        return checkAccess(L->copyCtor);
+    }
+
+    if (L->paramCtorAvail == Avail::USER) {
+        FunDecl* c = L->paramCtor;
+        if (!checkArgList(args, info, c->layout.params, 1, nm, line, col, false)) return false;
+        spec.kind = IK_CTOR;
+        spec.args = args;
+        spec.argInfo = info;
+        spec.ctor = c;
+        return checkAccess(c);
+    }
+    (void)rd;
+    addError("'" + nm + "' no tiene un constructor que acepte " + to_string(args.size()) + " argumento(s)", line, col);
+    return false;
 }
 
 Type TypeChecker::checkCall(PostfixExp* call) {
     Exp* base = call->base;
+    call->argInfo.clear();
+    call->retTemp = 0;
+    call->ctorKind = IK_NONE;
 
     if (base->nodeKind() == NodeKind::ID_EXP) {
         IdExp* id = static_cast<IdExp*>(base);
@@ -867,7 +1572,11 @@ Type TypeChecker::checkCall(PostfixExp* call) {
             if (it != currentRecord->layout.methods.end()) {
                 call->callKind = CALL_METHOD_IMPLICIT;
                 call->callee = it->second.fun;
-                checkArgs(call, call->callee, name);
+                if (currentFunction && currentFunction->isConst && currentFunction->funKind == FunKind::NORMAL &&
+                    !call->callee->isConst) {
+                    addError("Un método const no puede llamar al método no const '" + name + "'", call->line, call->col);
+                }
+                checkArgList(call->args, call->argInfo, call->callee->layout.params, 1, name, call->line, call->col);
                 return callResult(call, call->callee);
             }
         }
@@ -876,8 +1585,25 @@ Type TypeChecker::checkCall(PostfixExp* call) {
         if (fit != functions.end()) {
             call->callKind = CALL_FUNCTION;
             call->callee = fit->second;
-            checkArgs(call, call->callee, name);
+            checkArgList(call->args, call->argInfo, call->callee->layout.params, 0, name, call->line, call->col);
             return callResult(call, call->callee);
+        }
+
+        auto rit = records.find(name);
+        if (rit != records.end() && id->parts.size() == 1) {
+            // T(args): construye un temporal
+            Type rec = Type::makeRecord(name);
+            InitSpec sp;
+            vector<ArgInfo> info;
+            if (!resolveCtorCall(rec, call->args, info, sp, call->line, call->col, false)) {
+                return annotate(call, Type::makeError());
+            }
+            call->callKind = CALL_CTOR;
+            call->callee = sp.ctor;
+            call->ctorKind = sp.kind;
+            call->argInfo = info;
+            call->retTemp = allocTemp(rec);
+            return annotate(call, rec);
         }
 
         if (name == "sqrt" || name == "std::sqrt") {
@@ -925,11 +1651,19 @@ Type TypeChecker::checkCall(PostfixExp* call) {
             }
 
             const string& m = pf->memberName;
+            bool objConst = rec.constAt(0);
 
             if (rec.kind == Type::STRING) {
                 for (Exp* a : call->args) a->accept(this);
                 call->callKind = CALL_BUILTIN;
                 size_t n = call->args.size();
+                auto needMutable = [&]() {
+                    if (objConst) {
+                        addError("El método '" + m + "' modifica el string, pero el objeto es const", call->line, call->col);
+                        return false;
+                    }
+                    return true;
+                };
                 if ((m == "size" || m == "length") && n == 0) {
                     call->builtin = BI_STR_SIZE;
                     return annotate(call, makeType(Type::INT));
@@ -940,11 +1674,14 @@ Type TypeChecker::checkCall(PostfixExp* call) {
                 }
                 if (m == "clear" && n == 0) {
                     call->builtin = BI_STR_CLEAR;
+                    if (!needMutable()) return annotate(call, Type::makeError());
                     return annotate(call, makeType(Type::VOID));
                 }
                 if (m == "c_str" && n == 0) {
                     call->builtin = BI_STR_C_STR;
-                    return annotate(call, makeType(Type::CHAR, 1));
+                    Type ct = makeType(Type::CHAR, 1);
+                    ct.constBits |= 1u;
+                    return annotate(call, ct);
                 }
                 if (m == "append" && n == 1) {
                     Type at = decay(call->args[0]->inferredType.withoutRef());
@@ -954,6 +1691,7 @@ Type TypeChecker::checkCall(PostfixExp* call) {
                         addError("append espera un string o un char*", call->line, call->col);
                         return annotate(call, Type::makeError());
                     }
+                    if (!needMutable()) return annotate(call, Type::makeError());
                     return annotate(call, makeType(Type::VOID));
                 }
                 if (m == "push_back" && n == 1) {
@@ -962,6 +1700,7 @@ Type TypeChecker::checkCall(PostfixExp* call) {
                         return annotate(call, Type::makeError());
                     }
                     call->builtin = BI_STR_APPEND_CHAR;
+                    if (!needMutable()) return annotate(call, Type::makeError());
                     return annotate(call, makeType(Type::VOID));
                 }
                 addError("Método de string no soportado: '" + m + "' con " + to_string(n) + " argumentos",
@@ -984,7 +1723,11 @@ Type TypeChecker::checkCall(PostfixExp* call) {
                 }
                 call->callKind = CALL_METHOD;
                 call->callee = it->second.fun;
-                checkArgs(call, call->callee, m);
+                if (objConst && !call->callee->isConst) {
+                    addError("No se puede llamar al método no const '" + m + "' sobre un objeto const",
+                             call->line, call->col);
+                }
+                checkArgList(call->args, call->argInfo, call->callee->layout.params, 1, m, call->line, call->col);
                 return callResult(call, call->callee);
             }
 
@@ -1010,8 +1753,13 @@ Type TypeChecker::visit(PostfixExp* exp) {
                 addError("Operador '++ / --' requiere un lvalue numérico (no bool) o puntero", exp->line, exp->col);
                 return annotate(exp, Type::makeError());
             }
+            if (bt0.isConstObj()) {
+                addError("No se puede modificar un objeto const con '++ / --' (tipo '" + bt0.toString() + "')",
+                         exp->line, exp->col);
+                return annotate(exp, Type::makeError());
+            }
             if (bt.isPointer()) exp->ptrScale = pointeeSize(bt, exp->line, exp->col);
-            return annotate(exp, bt0.withoutRef());
+            return annotate(exp, bt0.withoutRef().withoutConst());
         }
 
         case ARRAY_ACCESS: {
@@ -1027,10 +1775,10 @@ Type TypeChecker::visit(PostfixExp* exp) {
                 res = bt.elementType();
             } else if (bt.isPointer()) {
                 pointeeSize(bt, exp->line, exp->col);
-                res = bt.withoutRef();
-                res.ptrLevel--;
+                res = bt.withoutRef().pointee();
             } else if (bt.isString()) {
                 res = makeType(Type::CHAR);
+                if (bt.isConstObj()) res = res.withTopConst();
             } else {
                 addError("Subíndice '[]' aplicado a un tipo que no es arreglo, puntero ni string: " + bt.toString(),
                          exp->line, exp->col);
@@ -1051,9 +1799,15 @@ Type TypeChecker::visit(PostfixExp* exp) {
 }
 
 Type TypeChecker::visit(NewExp* exp) {
+    exp->spec = InitSpec();
+    exp->hasCookie = false;
+    exp->valueInit = false;
+    exp->ptrTemp = 0;
+
     Type t = resolveType(exp->allocType, exp->line, exp->col);
     if (t.isError()) {
         for (Exp* d : exp->arrayDims) d->accept(this);
+        for (Exp* a : exp->ctorArgs) a->accept(this);
         return annotate(exp, t);
     }
     exp->allocType = t;
@@ -1071,20 +1825,65 @@ Type TypeChecker::visit(NewExp* exp) {
         addError("No se puede reservar memoria de tipo void", exp->line, exp->col);
         return annotate(exp, Type::makeError());
     }
-    if (hasStrings(t)) {
-        addError("'new' de string o de records con string no soportado (no hay constructores)", exp->line, exp->col);
+
+    bool isArr = !exp->arrayDims.empty();
+    if (isArr && !exp->ctorArgs.empty()) {
+        addError("'new T[n]' no admite argumentos de constructor", exp->line, exp->col);
         return annotate(exp, Type::makeError());
     }
+
+    if (isClassObj(t)) {
+        exp->ptrTemp = allocTemp(Type(Type::VOID, 1, false));
+        if (!isArr && exp->hasParens) {
+            vector<ArgInfo> info;
+            if (!resolveCtorCall(t, exp->ctorArgs, info, exp->spec, exp->line, exp->col, false)) {
+                return annotate(exp, Type::makeError());
+            }
+            if (t.kind == Type::RECORD && exp->ctorArgs.empty()) {
+                exp->valueInit = layoutOf(t)->defaultCtorAvail != Avail::USER;
+            }
+        } else if (t.kind == Type::RECORD) {
+            if (!needsDefaultInit(t, "'new " + t.recordName + "'", exp->line, exp->col)) {
+                return annotate(exp, Type::makeError());
+            }
+            exp->spec.kind = IK_DEFAULT;
+            exp->spec.ctor = layoutOf(t)->defaultCtor;
+        } else {
+            exp->spec.kind = IK_DEFAULT;
+        }
+        if (isArr) exp->hasCookie = !dtorTrivial(t);
+    } else if (exp->hasParens && !isArr) {
+        for (Exp* a : exp->ctorArgs) a->accept(this);
+        if (exp->ctorArgs.size() > 1) {
+            addError("'new' de un escalar admite a lo sumo un valor inicial", exp->line, exp->col);
+            return annotate(exp, Type::makeError());
+        }
+        if (exp->ctorArgs.empty()) {
+            exp->valueInit = true;
+            exp->ptrTemp = allocTemp(Type(Type::VOID, 1, false));
+        } else if (!exp->ctorArgs[0]->inferredType.isError()) {
+            if (!assignable(t, exp->ctorArgs[0])) {
+                addError("Valor inicial de tipo '" + exp->ctorArgs[0]->inferredType.toString() +
+                         "' incompatible con '" + t.toString() + "'", exp->line, exp->col);
+                return annotate(exp, Type::makeError());
+            }
+            exp->spec.kind = IK_VALUE;
+            exp->spec.expr = exp->ctorArgs[0];
+            exp->ptrTemp = allocTemp(Type(Type::VOID, 1, false));
+        }
+    }
     exp->elemSize = sizeOf(t);
-    Type res = t;
-    res.ptrLevel++;
-    return annotate(exp, res);
+    return annotate(exp, t.addressOf());
 }
 
 Type TypeChecker::visit(DeleteExp* exp) {
+    exp->hasCookie = false;
     Type t = exp->exp->accept(this);
     if (!t.isError() && !t.isPointer()) {
         addError("Operador 'delete' requiere un puntero", exp->line, exp->col);
+    } else if (!t.isError()) {
+        exp->pointeeType = t.withoutRef().pointee();
+        exp->hasCookie = exp->isArray && isClassObj(exp->pointeeType) && !dtorTrivial(exp->pointeeType);
     }
     return annotate(exp, makeType(Type::VOID));
 }
@@ -1193,9 +1992,11 @@ void TypeChecker::visit(ReturnStmt* stm) {
     Type et = stm->expr->accept(this);
     if (et.isError()) return;
     if (retType.isRef) {
-        if (!stm->expr->isLValue || !et.withoutRef().sameBase(retType)) {
-            addError("Una función que retorna '" + retType.toString() + "' debe devolver una variable de ese tipo",
-                     stm->line, stm->col);
+        Type tb = retType.withoutRef();
+        Type eb = et.withoutRef();
+        if (!stm->expr->isLValue || !eb.sameBase(tb) || !refBindable(tb, eb)) {
+            addError("Una función que retorna '" + retType.toString() + "' debe devolver una variable de ese tipo" +
+                     (stm->expr->isLValue ? " sin perder const" : ""), stm->line, stm->col);
         }
     } else if (!assignable(retType, stm->expr)) {
         addError("Tipo de retorno incompatible en '" + currentFunction->name +
@@ -1210,38 +2011,109 @@ void TypeChecker::visit(VarInit* /*init*/) {
     // Manejado en VarDecl
 }
 
+bool TypeChecker::needsDefaultInit(const Type& t, const string& what, int line, int col) {
+    Type et = t;
+    et.arrayDims.clear();
+    if (et.kind == Type::RECORD && isClassObj(et)) {
+        RecordLayout* L = layoutOf(et);
+        if (L && L->defaultCtorAvail != Avail::USER && L->defaultCtorAvail != Avail::IMPLICIT) {
+            addError(what + " requiere el constructor por defecto de '" + et.recordName +
+                     "', que no existe o no está disponible", line, col);
+            return false;
+        }
+        if (L && L->defaultCtor && L->defaultCtor->isPrivate &&
+            (!currentRecord || currentRecord->name != et.recordName)) {
+            addError("El constructor por defecto de '" + et.recordName + "' es privado", line, col);
+            return false;
+        }
+    }
+    return true;
+}
+
 void TypeChecker::checkInitializer(const Type& target, Exp* init, int line, int col) {
     if (init->nodeKind() == NodeKind::BRACED_INIT) {
         BracedInitList* bl = static_cast<BracedInitList*>(init);
         annotate(bl, target);
+        bl->aggType = target;
         bl->elementOffsets.clear();
         bl->elementTypes.clear();
+        bl->omitted.clear();
 
         if (target.isArray()) {
             Type et = target.elementType();
             int esz = sizeOf(et);
-            if (static_cast<int>(bl->elements.size()) > target.arrayDims[0]) {
-                addError("Demasiados inicializadores para el arreglo (máximo " +
-                         to_string(target.arrayDims[0]) + ")", line, col);
+            int dim0 = target.arrayDims[0];
+            if (static_cast<int>(bl->elements.size()) > dim0) {
+                addError("Demasiados inicializadores para el arreglo (máximo " + to_string(dim0) + ")", line, col);
             }
             for (size_t i = 0; i < bl->elements.size(); i++) {
                 bl->elementOffsets.push_back(static_cast<int>(i) * esz);
                 bl->elementTypes.push_back(et);
                 checkInitializer(et, bl->elements[i], line, col);
             }
+            int given = static_cast<int>(bl->elements.size());
+            int rest = dim0 - (given < dim0 ? given : dim0);
+            if (rest > 0 && isClassObj(et) && !defaultTrivial(et)) {
+                if (needsDefaultInit(et, "Los elementos omitidos del arreglo", line, col)) {
+                    BracedInitList::Omitted om;
+                    om.offset = given * esz;
+                    om.type = et;
+                    om.count = rest;
+                    om.spec.kind = IK_DEFAULT;
+                    RecordLayout* L = layoutOf(et);
+                    om.spec.ctor = L ? L->defaultCtor : nullptr;
+                    bl->omitted.push_back(om);
+                }
+            }
         } else if (target.isRecord()) {
-            RecordLayout& L = records[target.recordName]->layout;
-            if (hasStrings(target)) {
-                addError("Inicialización con llaves no soportada para records con string", line, col);
+            RecordLayout& L = *layoutOf(target);
+            if (!L.isAggregate) {
+                addError("'" + target.recordName + "' no es un agregado (tiene constructores o miembros privados); "
+                         "use '" + target.recordName + " x(args);'", line, col);
+                for (Exp* e : bl->elements) {
+                    if (e->nodeKind() != NodeKind::BRACED_INIT) e->accept(this);
+                }
                 return;
             }
             if (bl->elements.size() > L.fields.size()) {
                 addError("Demasiados inicializadores para '" + target.recordName + "'", line, col);
             }
             for (size_t i = 0; i < bl->elements.size() && i < L.fields.size(); i++) {
+                if (L.fields[i].type.isRef) {
+                    addError("Inicializar un campo de referencia con llaves no está soportado: '" +
+                             L.fields[i].name + "'", line, col);
+                    continue;
+                }
                 bl->elementOffsets.push_back(L.fields[i].offset);
                 bl->elementTypes.push_back(L.fields[i].type);
                 checkInitializer(L.fields[i].type, bl->elements[i], line, col);
+            }
+            for (size_t i = bl->elements.size(); i < L.fields.size(); i++) {
+                const FieldInfo& f = L.fields[i];
+                if (f.type.isRef) {
+                    addError("El campo de referencia '" + f.name + "' debe inicializarse", line, col);
+                    continue;
+                }
+                BracedInitList::Omitted om;
+                om.offset = f.offset;
+                om.type = f.type;
+                if (f.classInit) {
+                    om.spec.kind = (f.classInit->nodeKind() == NodeKind::BRACED_INIT) ? IK_BRACED : IK_VALUE;
+                    om.spec.expr = f.classInit;
+                } else if (isClassObj(f.type) && !defaultTrivial(f.type)) {
+                    if (!needsDefaultInit(f.type, "El campo omitido '" + f.name + "'", line, col)) continue;
+                    Type et = f.type;
+                    om.count = 1;
+                    for (int d : et.arrayDims) om.count *= d;
+                    et.arrayDims.clear();
+                    om.type = et;
+                    om.spec.kind = IK_DEFAULT;
+                    RecordLayout* fl = layoutOf(et);
+                    om.spec.ctor = fl ? fl->defaultCtor : nullptr;
+                } else {
+                    continue;   // el campo queda en cero
+                }
+                bl->omitted.push_back(om);
             }
         } else if (!target.isRef && (target.isNumeric() || target.isPointer())) {
             if (bl->elements.size() > 1) {
@@ -1259,16 +2131,138 @@ void TypeChecker::checkInitializer(const Type& target, Exp* init, int line, int 
 
     Type it = init->accept(this);
     if (it.isError()) return;
-    if (target.isRef) {
-        if (!init->isLValue || !it.withoutRef().sameBase(target) || it.isArray()) {
-            addError("Una referencia '" + target.toString() + "' debe inicializarse con una variable del mismo tipo",
-                     line, col);
-        }
-    } else if (target.isArray()) {
+    if (target.isArray()) {
         addError("Un arreglo solo puede inicializarse con una lista entre llaves", line, col);
+    } else if (target.isRef) {
+        addError("No se puede inicializar una referencia dentro de una lista con llaves", line, col);
     } else if (!assignable(target, init)) {
         addError("Inicialización incompatible: tipo '" + target.toString() + "' inicializado con '" +
                  it.toString() + "'", line, col);
+    }
+}
+
+// Decide como se inicializa la variable y lo deja en vi->spec
+void TypeChecker::checkVarInit(VarInit* vi, const Type& t) {
+    InitSpec& sp = vi->spec;
+    sp = InitSpec();
+    int line = vi->line, col = vi->col;
+    bool cls = isClassObj(t);
+
+    if (vi->directInit) {
+        if (t.isArray()) {
+            addError("Un arreglo no puede inicializarse con paréntesis: '" + vi->name + "'", line, col);
+            return;
+        }
+        if (t.isRef) {
+            addError("Una referencia debe inicializarse con '='", line, col);
+            return;
+        }
+        if (t.kind == Type::RECORD && cls) {
+            if (vi->ctorArgs.empty()) {
+                addError("'" + t.recordName + " " + vi->name + "()' declara una función; escriba '" +
+                         t.recordName + " " + vi->name + ";'", line, col);
+                return;
+            }
+            vector<ArgInfo> info;
+            resolveCtorCall(t, vi->ctorArgs, info, sp, line, col, false);
+            return;
+        }
+        for (Exp* a : vi->ctorArgs) a->accept(this);
+        if (vi->ctorArgs.size() != 1) {
+            addError("La inicialización con paréntesis de '" + vi->name + "' espera un solo valor", line, col);
+            return;
+        }
+        if (vi->ctorArgs[0]->inferredType.isError()) return;
+        if (!assignable(t, vi->ctorArgs[0])) {
+            addError("Inicialización incompatible: tipo '" + t.toString() + "' inicializado con '" +
+                     vi->ctorArgs[0]->inferredType.toString() + "'", line, col);
+            return;
+        }
+        sp.kind = IK_VALUE;
+        sp.expr = vi->ctorArgs[0];
+        return;
+    }
+
+    if (vi->initializer) {
+        Exp* init = vi->initializer;
+        if (init->nodeKind() == NodeKind::BRACED_INIT) {
+            BracedInitList* bl = static_cast<BracedInitList*>(init);
+            if (t.isRef) {
+                addError("Una referencia no puede inicializarse con llaves", line, col);
+                return;
+            }
+            if (t.kind == Type::RECORD && cls && t.arrayDims.empty() && !layoutOf(t)->isAggregate) {
+                // T t = {a, b} sobre una clase con constructores: se resuelve como T t(a, b)
+                annotate(bl, t);
+                vector<ArgInfo> info;
+                resolveCtorCall(t, bl->elements, info, sp, line, col, false);
+                return;
+            }
+            checkInitializer(t, init, line, col);
+            sp.kind = IK_BRACED;
+            sp.expr = init;
+            return;
+        }
+        if (t.isRef) {
+            bindRefInit(t, init, sp, line, col, true);
+            return;
+        }
+        Type it = init->accept(this);
+        if (it.isError()) return;
+        if (t.isArray()) {
+            addError("Un arreglo solo puede inicializarse con una lista entre llaves", line, col);
+            return;
+        }
+        if (t.kind == Type::RECORD && cls) {
+            Type ib = it.withoutRef();
+            if (!ib.isRecord() || ib.recordName != t.recordName) {
+                addError("Inicialización incompatible: tipo '" + t.toString() + "' inicializado con '" +
+                         it.toString() + "' (los constructores de conversión no están soportados)", line, col);
+                return;
+            }
+            RecordLayout* L = layoutOf(t);
+            if (L->copyCtorAvail == Avail::DELETED) {
+                addError("El constructor de copia de '" + t.recordName + "' no está disponible", line, col);
+                return;
+            }
+            sp.kind = IK_COPY;
+            sp.expr = init;
+            sp.ctor = L->copyCtor;
+            return;
+        }
+        if (!assignable(t, init)) {
+            addError("Inicialización incompatible: tipo '" + t.toString() + "' inicializado con '" +
+                     it.toString() + "'", line, col);
+            return;
+        }
+        sp.kind = IK_VALUE;
+        sp.expr = init;
+        return;
+    }
+
+    if (t.isRef) return;   // el parser ya lo rechaza
+
+    if (t.isConstObj()) {
+        Type et = t;
+        et.arrayDims.clear();
+        bool ok = false;
+        if (et.kind == Type::STRING && isClassObj(et)) ok = true;
+        else if (et.kind == Type::RECORD && isClassObj(et)) ok = layoutOf(et)->defaultCtorAvail == Avail::USER;
+        if (!ok) {
+            addError("El objeto const '" + vi->name + "' debe inicializarse", line, col);
+            return;
+        }
+    }
+    if (cls) {
+        Type et = t;
+        et.arrayDims.clear();
+        if (et.kind == Type::RECORD) {
+            if (!needsDefaultInit(et, "La declaración de '" + vi->name + "'", line, col)) return;
+            sp.kind = IK_DEFAULT;
+            sp.ctor = layoutOf(et)->defaultCtor;
+        } else {
+            sp.kind = IK_DEFAULT;
+        }
     }
 }
 
@@ -1281,7 +2275,7 @@ void TypeChecker::visit(VarDecl* decl) {
             addError("Redeclaración de variable en el mismo ámbito: '" + vi->name + "'", vi->line, vi->col);
         }
 
-        Type t = declaredType(decl->baseType, vi->ptrCount, vi->isRef, vi->arrayDims, vi->line, vi->col);
+        Type t = declaredType(decl->baseType, vi->ptrCount, vi->isRef, vi->ptrConst, vi->arrayDims, vi->line, vi->col);
 
         if (!t.isError()) {
             if (t.kind == Type::VOID && t.ptrLevel == 0) {
@@ -1292,19 +2286,15 @@ void TypeChecker::visit(VarDecl* decl) {
             } else if (t.isRef && t.isArray()) {
                 addError("Arreglo de referencias no permitido: '" + vi->name + "'", vi->line, vi->col);
                 t = Type::makeError();
-            } else if (t.isArray() && hasStrings(t)) {
-                addError("Arreglos de string o de records con string no soportados: '" + vi->name + "'",
-                         vi->line, vi->col);
-                t = Type::makeError();
             }
         }
 
-        if (vi->initializer) {
-            if (t.isError()) {
-                if (vi->initializer->nodeKind() != NodeKind::BRACED_INIT) vi->initializer->accept(this);
-            } else {
-                checkInitializer(t, vi->initializer, vi->line, vi->col);
-            }
+        vi->spec = InitSpec();
+        if (t.isError()) {
+            if (vi->initializer && vi->initializer->nodeKind() != NodeKind::BRACED_INIT) vi->initializer->accept(this);
+            for (Exp* a : vi->ctorArgs) a->accept(this);
+        } else {
+            checkVarInit(vi, t);
         }
 
         VarInfo info;
@@ -1312,8 +2302,14 @@ void TypeChecker::visit(VarDecl* decl) {
             info.type = t;
         } else {
             info = makeVarInfo(t, global, vi->name);
-            if (!global) {
-                for (int so : info.stringOffsets) curStringSlots.push_back(info.offset + so);
+            bool intLike = t.ptrLevel == 0 && !t.isRef && t.arrayDims.empty() &&
+                           (t.kind == Type::INT || t.kind == Type::CHAR || t.kind == Type::BOOL);
+            if (intLike && t.isConstObj() && vi->initializer && vi->initializer->nodeKind() != NodeKind::BRACED_INIT) {
+                long long v;
+                if (constEval(vi->initializer, v)) {
+                    info.hasConstVal = true;
+                    info.constVal = v;
+                }
             }
         }
         vi->info = info;
@@ -1323,6 +2319,7 @@ void TypeChecker::visit(VarDecl* decl) {
 
 void TypeChecker::visit(Param* param) {
     VarInfo& slot = currentFunction->layout.params[paramIndex];
+    const AbiLoc abi = currentFunction->layout.paramAbi[paramIndex];
     Type t = slot.type;
     paramIndex++;
 
@@ -1332,6 +2329,20 @@ void TypeChecker::visit(Param* param) {
     VarInfo info;
     if (t.isError()) {
         info.type = t;
+    } else if (abi.pass == Pass::STACK) {
+        // el parametro vive en el area de argumentos del llamador
+        info.type = t;
+        info.size = sizeOf(t);
+        info.align = alignOf(t);
+        info.storage = Storage::LOCAL;
+        info.offset = 16 + abi.stackOffset;
+    } else if (abi.pass == Pass::INVISIBLE_REF) {
+        info = allocLocal(Type(Type::VOID, 1, false));
+        info.type = t;
+        info.indirect = true;
+        if (abi.reg[0] < 0) {
+            // el puntero llega por la pila: se guarda igualmente en un slot local
+        }
     } else {
         info = allocLocal(t);
     }
@@ -1340,10 +2351,104 @@ void TypeChecker::visit(Param* param) {
     env.add_var(param->name, info);
 }
 
+// Plan de inicializacion de los campos de un constructor, en orden de declaracion
+void TypeChecker::planCtor(FunDecl* fun, RecordDecl* rec) {
+    RecordLayout& L = rec->layout;
+    fun->fieldInits.clear();
+    bool isCopy = fun->isImplicit && !fun->params.empty();
+
+    // la lista del usuario: nombres validos y sin repeticiones
+    unordered_map<string, MemberInit*> listed;
+    for (MemberInit& mi : fun->memberInits) {
+        if (L.fieldIndex(mi.name) < 0) {
+            addError("'" + mi.name + "' no es un campo de '" + rec->name + "'", mi.line, mi.col);
+            for (Exp* a : mi.args) a->accept(this);
+            continue;
+        }
+        if (listed.count(mi.name)) {
+            addError("El campo '" + mi.name + "' se inicializa más de una vez", mi.line, mi.col);
+            for (Exp* a : mi.args) a->accept(this);
+            continue;
+        }
+        listed[mi.name] = &mi;
+    }
+
+    for (size_t i = 0; i < L.fields.size(); i++) {
+        const FieldInfo& f = L.fields[i];
+        FieldInit fi;
+        fi.fieldIndex = static_cast<int>(i);
+        InitSpec& sp = fi.spec;
+        Type et = f.type;
+        et.arrayDims.clear();
+        bool cls = isClassObj(f.type);
+
+        auto it = listed.find(f.name);
+        if (isCopy) {
+            sp.kind = IK_COPY;
+        } else if (it != listed.end()) {
+            MemberInit& mi = *it->second;
+            if (f.type.isArray()) {
+                addError("Inicializar el arreglo '" + f.name + "' en la lista de inicialización no está soportado",
+                         mi.line, mi.col);
+                for (Exp* a : mi.args) a->accept(this);
+            } else if (f.type.isRef) {
+                for (Exp* a : mi.args) a->accept(this);
+                if (mi.args.size() != 1) {
+                    addError("La referencia '" + f.name + "' se inicializa con un solo valor", mi.line, mi.col);
+                } else {
+                    bindRefInit(f.type, mi.args[0], sp, mi.line, mi.col, false);
+                }
+            } else if (f.type.kind == Type::RECORD && cls) {
+                vector<ArgInfo> info;
+                resolveCtorCall(f.type, mi.args, info, sp, mi.line, mi.col, false);
+            } else {
+                for (Exp* a : mi.args) a->accept(this);
+                if (mi.args.empty()) {
+                    if (cls) {
+                        sp.kind = IK_DEFAULT;
+                    } else {
+                        sp.kind = IK_VALUE;   // sin expresion: valor cero
+                        sp.expr = nullptr;
+                    }
+                } else if (mi.args.size() > 1) {
+                    addError("El campo '" + f.name + "' se inicializa con un solo valor", mi.line, mi.col);
+                } else if (!mi.args[0]->inferredType.isError()) {
+                    if (!assignable(f.type, mi.args[0])) {
+                        addError("Inicialización incompatible del campo '" + f.name + "': tipo '" +
+                                 f.type.toString() + "' inicializado con '" +
+                                 mi.args[0]->inferredType.toString() + "'", mi.line, mi.col);
+                    } else {
+                        sp.kind = IK_VALUE;
+                        sp.expr = mi.args[0];
+                    }
+                }
+            }
+        } else if (f.classInit) {
+            sp.kind = (f.classInit->nodeKind() == NodeKind::BRACED_INIT) ? IK_BRACED : IK_VALUE;
+            sp.expr = f.classInit;
+        } else if (f.type.isRef) {
+            addError("El campo de referencia '" + f.name + "' debe inicializarse en la lista de inicialización de '" +
+                     rec->name + "'", fun->line, fun->col);
+        } else if (f.type.isConstObj() && !cls) {
+            addError("El campo const '" + f.name + "' debe inicializarse en la lista de inicialización de '" +
+                     rec->name + "'", fun->line, fun->col);
+        } else if (cls) {
+            if (needsDefaultInit(f.type, "El campo '" + f.name + "' (inicializar en la lista si no tiene constructor por defecto)",
+                                 fun->line, fun->col)) {
+                sp.kind = IK_DEFAULT;
+                RecordLayout* fl = layoutOf(et);
+                sp.ctor = fl ? fl->defaultCtor : nullptr;
+            }
+        } else {
+            sp.kind = IK_NONE;
+        }
+        fun->fieldInits.push_back(fi);
+    }
+}
+
 void TypeChecker::visit(FunDecl* fun) {
     currentFunction = fun;
     frameUsed = 0;
-    curStringSlots.clear();
     loopDepth = 0;
     env.add_level(); // ambito de la funcion
 
@@ -1358,6 +2463,18 @@ void TypeChecker::visit(FunDecl* fun) {
         p->accept(this);
     }
 
+    // slots del retorno: puntero oculto o valor para retorno por registros
+    if (fun->layout.retAbi.pass == Pass::HIDDEN_PTR) {
+        fun->layout.retPtrOffset = allocLocal(Type(Type::VOID, 1, false)).offset;
+    } else if (fun->layout.retAbi.pass == Pass::AGG_REGS) {
+        frameUsed = alignUp(frameUsed, 8) + 16;
+        fun->layout.retValOffset = -frameUsed;
+    }
+
+    if (fun->funKind == FunKind::CTOR && currentRecord) {
+        planCtor(fun, currentRecord);
+    }
+
     if (fun->body) {
         // los items se visitan en el mismo nivel de los parametros
         for (ASTNode* item : fun->body->items) {
@@ -1367,11 +2484,6 @@ void TypeChecker::visit(FunDecl* fun) {
 
     env.remove_level();
 
-    fun->layout.stringSlots = curStringSlots;
-    if (!curStringSlots.empty()) {
-        frameUsed = alignUp(frameUsed, 8) + 16;
-        fun->layout.retSaveOffset = -frameUsed;
-    }
     fun->layout.frameSize = alignUp(frameUsed, 16);
     currentFunction = nullptr;
 }
@@ -1397,6 +2509,9 @@ void TypeChecker::visit(RecordDecl* record) {
     }
     for (RecordMember* m : record->members) {
         m->accept(this);
+    }
+    for (FunDecl* f : record->implicitFuns) {
+        f->accept(this);
     }
     env.remove_level();
     currentRecord = nullptr;
@@ -1428,9 +2543,22 @@ void TypeChecker::visit(Program* prog) {
         usg->accept(this);
     }
 
-    // Primer pase en orden fuente: layout de records y firmas de funciones
+    // Primer pase en orden fuente: constantes globales, layout de records y firmas de funciones
+    globalConsts.clear();
     for (ASTNode* decl : prog->declarations) {
-        if (decl->nodeKind() == NodeKind::RECORD_DECL) {
+        if (decl->nodeKind() == NodeKind::VAR_DECL) {
+            VarDecl* vd = static_cast<VarDecl*>(decl);
+            if (!(vd->baseType.constBits & 1u)) continue;
+            Type::Kind k = vd->baseType.kind;
+            if (k != Type::INT && k != Type::CHAR && k != Type::BOOL) continue;
+            for (VarInit* vi : vd->inits) {
+                long long v;
+                if (vi->ptrCount == 0 && !vi->isRef && vi->arrayDims.empty() && vi->initializer &&
+                    vi->initializer->nodeKind() != NodeKind::BRACED_INIT && constEval(vi->initializer, v)) {
+                    globalConsts[vi->name] = v;
+                }
+            }
+        } else if (decl->nodeKind() == NodeKind::RECORD_DECL) {
             declareRecord(static_cast<RecordDecl*>(decl));
         } else if (decl->nodeKind() == NodeKind::FUN_DECL) {
             declareFunction(static_cast<FunDecl*>(decl), nullptr);
@@ -1439,6 +2567,13 @@ void TypeChecker::visit(Program* prog) {
 
     // Segundo pase en orden fuente: globales, cuerpos de funciones y metodos
     for (ASTNode* decl : prog->declarations) {
-        decl->accept(this);
+        if (decl->nodeKind() == NodeKind::VAR_DECL) {
+            // las temporales de los inicializadores globales viven en el marco de la rutina de inicio
+            frameUsed = initFrameUsed;
+            decl->accept(this);
+            initFrameUsed = frameUsed;
+        } else {
+            decl->accept(this);
+        }
     }
 }

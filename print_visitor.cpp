@@ -346,11 +346,27 @@ void ASTPrinter::visit(Param* param) {
 
 void ASTPrinter::visit(FunDecl* fun) {
     printIndent();
-    out << "FunDecl: " << fun->returnType.toString() << " " << fun->name << "(...) [L" << fun->line << ":" << fun->col << "]\n";
+    const char* kind = "FunDecl";
+    if (fun->funKind == FunKind::CTOR) kind = "Constructor";
+    else if (fun->funKind == FunKind::DTOR) kind = "Destructor";
+    else if (fun->funKind == FunKind::COPY_ASSIGN) kind = "CopyAssign";
+    out << kind << ": " << fun->returnType.toString() << " " << fun->name << "(...)"
+        << (fun->isConst ? " const" : "") << " [L" << fun->line << ":" << fun->col << "]\n";
 
     for (Param* p : fun->params) {
         pushNode(false);
         p->accept(this);
+        popNode();
+    }
+    for (const MemberInit& mi : fun->memberInits) {
+        pushNode(false);
+        printIndent();
+        out << "MemberInit: " << mi.name << " [L" << mi.line << ":" << mi.col << "]\n";
+        for (size_t i = 0; i < mi.args.size(); i++) {
+            pushNode(i + 1 == mi.args.size());
+            mi.args[i]->accept(this);
+            popNode();
+        }
         popNode();
     }
 

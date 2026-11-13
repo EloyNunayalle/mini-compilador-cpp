@@ -6,37 +6,37 @@ using namespace std;
 Type::Type()
     : kind(VOID), ptrLevel(0), isRef(false), recordName(""),
       intValue(0), doubleValue(0.0), boolValue(false), charValue('\0'),
-      stringValue(""), isConstExpr(false) { }
+      stringValue(""), isConstExpr(false), constBits(0) { }
 
 Type::Type(Kind k, int ptr, bool ref)
     : kind(k), ptrLevel(ptr), isRef(ref), recordName(""),
       intValue(0), doubleValue(0.0), boolValue(false), charValue('\0'),
-      stringValue(""), isConstExpr(false) { }
+      stringValue(""), isConstExpr(false), constBits(0) { }
 
 Type::Type(int val)
     : kind(INT), ptrLevel(0), isRef(false), recordName(""),
       intValue(val), doubleValue(val), boolValue(val != 0), charValue((char)val),
-      stringValue(to_string(val)), isConstExpr(true) { }
+      stringValue(to_string(val)), isConstExpr(true), constBits(0) { }
 
 Type::Type(double val, bool isFloat)
     : kind(isFloat ? FLOAT : DOUBLE), ptrLevel(0), isRef(false), recordName(""),
       intValue((int)val), doubleValue(val), boolValue(val != 0.0), charValue('\0'),
-      stringValue(to_string(val)), isConstExpr(true) { }
+      stringValue(to_string(val)), isConstExpr(true), constBits(0) { }
 
 Type::Type(bool val)
     : kind(BOOL), ptrLevel(0), isRef(false), recordName(""),
       intValue(val ? 1 : 0), doubleValue(val ? 1.0 : 0.0), boolValue(val), charValue('\0'),
-      stringValue(val ? "true" : "false"), isConstExpr(true) { }
+      stringValue(val ? "true" : "false"), isConstExpr(true), constBits(0) { }
 
 Type::Type(char val)
     : kind(CHAR), ptrLevel(0), isRef(false), recordName(""),
       intValue((int)val), doubleValue(0.0), boolValue(val != '\0'), charValue(val),
-      stringValue(string(1, val)), isConstExpr(true) { }
+      stringValue(string(1, val)), isConstExpr(true), constBits(0) { }
 
 Type::Type(const string& str)
     : kind(STRING), ptrLevel(0), isRef(false), recordName(""),
       intValue(0), doubleValue(0.0), boolValue(true), charValue('\0'),
-      stringValue(str), isConstExpr(true) { }
+      stringValue(str), isConstExpr(true), constBits(0) { }
 
 Type Type::makeRecord(const string& name, int ptr, bool ref) {
     Type t(RECORD, ptr, ref);
@@ -78,6 +78,34 @@ Type Type::elementType() const {
     return t;
 }
 
+Type Type::withTopConst(bool c) const {
+    Type t = *this;
+    if (c) t.constBits |= (1u << ptrLevel);
+    else t.constBits &= ~(1u << ptrLevel);
+    return t;
+}
+
+Type Type::withoutConst() const {
+    return withTopConst(false);
+}
+
+Type Type::pointee() const {
+    Type t = *this;
+    t.arrayDims.clear();
+    t.isRef = false;
+    if (t.ptrLevel > 0) t.ptrLevel--;
+    t.constBits &= (1u << (t.ptrLevel + 1)) - 1u;
+    return t;
+}
+
+Type Type::addressOf() const {
+    Type t = *this;
+    t.isRef = false;
+    t.ptrLevel++;
+    t.constBits &= ~(1u << t.ptrLevel);
+    return t;
+}
+
 Type Type::withoutRef() const {
     Type t = *this;
     t.isRef = false;
@@ -103,7 +131,7 @@ bool Type::operator!=(const Type& other) const {
 }
 
 string Type::toString() const {
-    string res = "";
+    string res = constAt(0) ? "const " : "";
     switch (kind) {
         case VOID:   res = "void"; break;
         case INT:    res = "int"; break;
@@ -118,7 +146,10 @@ string Type::toString() const {
         case ENDL:   res = "endl"; break;
         case ERROR:  res = "<error-type>"; break;
     }
-    for (int i = 0; i < ptrLevel; i++) res += "*";
+    for (int i = 0; i < ptrLevel; i++) {
+        res += "*";
+        if (constAt(i + 1)) res += " const";
+    }
     if (isRef) res += "&";
     for (int dim : arrayDims) {
         res += "[" + (dim > 0 ? to_string(dim) : "") + "]";

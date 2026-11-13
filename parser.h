@@ -29,6 +29,13 @@ private:
 
     bool isBaseTypeStart() const;
     bool peekIsStdString() const;
+    Token::Type peekTokenType() const;     // tipo del token que sigue al actual
+    bool startsCtorCall() const;           // T( ... ) al inicio de una sentencia
+    Type parseBaseTypeCore();
+    vector<MemberInit> parseMemberInitList();
+    RecordMember* parseCtorMember(const string& recordName, AccessSpecifier access);
+    RecordMember* parseDtorMember(const string& recordName, AccessSpecifier access);
+    unsigned parsePtrDeclarator(int& ptrs);  // { "*" [const] }, devuelve los bits const
 
 public:
     Parser(Scanner* scanner);

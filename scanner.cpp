@@ -33,6 +33,8 @@ static const unordered_map<string, Token::Type> KEYWORDS = {
     {"include",   Token::KW_INCLUDE},
     {"using",     Token::KW_USING},
     {"namespace", Token::KW_NAMESPACE},
+    {"const",     Token::KW_CONST},
+    {"operator",  Token::KW_OPERATOR},
     {"iostream",  Token::LIB_IOSTREAM},
     {"string",    Token::LIB_STRING},
     {"cmath",     Token::LIB_CMATH}

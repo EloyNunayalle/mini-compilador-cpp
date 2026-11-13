@@ -32,7 +32,11 @@ QualifiedId ::= id { "::" id }
 ## Tipos
 
 ```ebnf
-NonVoidBaseType ::= int
+Qualifier ::= const
+
+NonVoidBaseType ::= [ Qualifier ] BaseName [ Qualifier ]
+
+BaseName ::= int
                   | float
                   | double
                   | bool
@@ -43,10 +47,12 @@ NonVoidBaseType ::= int
 BaseType ::= NonVoidBaseType
            | void
 
-ReturnType ::= NonVoidBaseType { "*" } [ "&" ]
+PtrSuffix ::= "*" [ Qualifier ]
+
+ReturnType ::= NonVoidBaseType { PtrSuffix } [ "&" ]
              | void [ VoidPointerSuffix ]
 
-VoidPointerSuffix ::= "*" { "*" } [ "&" ]
+VoidPointerSuffix ::= PtrSuffix { PtrSuffix } [ "&" ]
 ```
 
 `string` requiere `#include <string>`; `std::string` se escribe como `QualifiedId`.
@@ -70,11 +76,12 @@ VarDecl ::= BaseType VarList ";"
 
 VarList ::= VarInit { "," VarInit }
 
-VarInit ::= { "*" }
+VarInit ::= { PtrSuffix }
             ( id [ ArrayDims ] [ "=" Initializer ]
+            | id "(" [ ArgList ] ")"
             | "&" id "=" Initializer )
 
-Declarator ::= { "*" }
+Declarator ::= { PtrSuffix }
                ( id [ ArrayDims ]
                | "&" id )
 
@@ -166,8 +173,28 @@ ClassKey ::= class
            | struct
 
 ClassMember ::= AccessSpecifier
-              | VarDecl
-              | FunDecl
+              | FieldDecl
+              | MethodDecl
+              | Constructor
+              | Destructor
+              | CopyAssign
+
+FieldDecl ::= BaseType FieldInit { "," FieldInit } ";"
+
+FieldInit ::= { PtrSuffix } id [ ArrayDims ] [ "=" Initializer ]
+
+MethodDecl ::= ReturnType id "(" [ ParamDeclList ] ")" [ const ] Block
+
+Constructor ::= id "(" [ ParamDeclList ] ")" [ ":" MemberInitList ] Block
+
+MemberInitList ::= MemberInit { "," MemberInit }
+
+MemberInit ::= id "(" [ ArgList ] ")"
+             | id "{" [ ArgList ] "}"
+
+Destructor ::= "~" id "(" ")" Block
+
+CopyAssign ::= ReturnType operator "=" "(" ParamDeclList ")" Block
 
 AccessSpecifier ::= public ":"
                   | private ":"
@@ -344,7 +371,7 @@ DeleteExpr ::= delete [ "[" "]" ] Unary
 ### New
 
 ```ebnf
-NewExpr ::= new NewType [ ArrayDims ]
+NewExpr ::= new NewType [ ArrayDims | "(" [ ArgList ] ")" ]
 
 NewType ::= NonVoidBaseType { "*" }
           | void "*" { "*" }
@@ -365,6 +392,7 @@ PostfixSuffix ::= "[" CExp "]"
                 | "--"
 
 Primary ::= QualifiedId
+          | QualifiedId "(" [ ArgList ] ")"      (* T(args): construye un temporal si T es un record *)
           | Num
           | Real
           | Bool
@@ -400,3 +428,5 @@ La gramática EBNF presenta algunas construcciones cuya interpretación requiere
 **Distinción entre declaraciones de funciones y variables.** Las producciones `FunDecl` y `VarDecl` pueden compartir un prefijo. Esta coincidencia no implica necesariamente una ambigüedad formal, pero puede requerir anticipación adicional o análisis especulativo para determinar qué producción corresponde al programa de entrada.
 
 Estas decisiones permiten mantener una gramática legible sin incorporar todas las restricciones contextuales en sus producciones. La gramática reconoce la estructura sintáctica, mientras que el parser resuelve las decisiones de interpretación indicadas y el análisis semántico verifica la validez de los tipos, las asignaciones y el uso de los identificadores.
+
+**Restricciones semánticas de las clases.** Un constructor con el nombre de la clase puede aparecer como máximo tres veces: por defecto, con parámetros (uno solo) y de copia (`T(const T&)` o `T(T&)`). `CopyAssign` solo admite la firma `T& operator=(const T&)`; no hay otra sobrecarga de operadores. No hay herencia, destructores virtuales, `explicit`, `mutable`, `volatile`, `constexpr`, `static` ni `friend`. Los inicializadores de campo en la clase deben ser expresiones constantes. `T t(args);` a nivel global se distingue de una función porque el primer token tras `(` no inicia un tipo.

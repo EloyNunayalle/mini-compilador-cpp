@@ -79,9 +79,9 @@ def run_tests():
     for ast_file in glob.glob(os.path.join(INPUT_DIR, "*_ast.txt")):
         shutil.move(ast_file, os.path.join(OUTPUT_DIR, os.path.basename(ast_file)))
 
-    reporte_file = os.path.join(OUTPUT_DIR, "reporte_avance_30.txt")
+    reporte_file = os.path.join(OUTPUT_DIR, "reporte_pruebas.txt")
     with open(reporte_file, "w") as f:
-        f.write("=== REPORTE DE EJECUCIÓN - AVANCE 30% PROYECTO 2 CS3402 ===\n")
+        f.write("REPORTE DE EJECUCIÓN DE PRUEBAS\n")
         f.write(f"Total pruebas: {total} | Pasaron: {pasaron} | Fallaron: {total - pasaron}\n\n")
         for l in reporte_lineas:
             f.write(l + "\n")

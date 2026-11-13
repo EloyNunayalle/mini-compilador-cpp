@@ -4,10 +4,8 @@
 #include "ast.h"
 #include "type.h"
 
-// =========================================================================
 // Interfaz Abstracta Visitor
 // Expresiones devuelven Type; Sentencias, Declaraciones y Programa devuelven void.
-// =========================================================================
 class Visitor {
 public:
     virtual ~Visitor() = default;

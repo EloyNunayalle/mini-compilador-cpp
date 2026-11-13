@@ -3,9 +3,7 @@
 
 using namespace std;
 
-// =========================================================================
 // Métodos de ayuda
-// =========================================================================
 string Exp::binopToString(BinaryOp op) {
     switch (op) {
         case PLUS_OP:    return "+";
@@ -44,9 +42,7 @@ string Exp::unaryopToString(UnaryOp op) {
     return "?";
 }
 
-// =========================================================================
 // Constructores y Destructores de Expresiones
-// =========================================================================
 BinaryExp::BinaryExp(Exp* l, Exp* r, BinaryOp op, int line, int col)
     : Exp(line, col), left(l), right(r), op(op) {}
 
@@ -148,9 +144,7 @@ BracedInitList::~BracedInitList() {
     for (Exp* e : elements) delete e;
 }
 
-// =========================================================================
 // Constructores y Destructores de Sentencias
-// =========================================================================
 BlockStmt::BlockStmt(int line, int col)
     : Stmt(line, col) {}
 
@@ -216,9 +210,7 @@ ReturnStmt::~ReturnStmt() {
     delete expr;
 }
 
-// =========================================================================
 // Constructores y Destructores de Declaraciones
-// =========================================================================
 VarInit::VarInit(const string& n, int ptrs, bool ref, const vector<Exp*>& dims, Exp* init, int line, int col)
     : ASTNode(line, col), name(n), ptrCount(ptrs), isRef(ref), arrayDims(dims), initializer(init) {}
 
@@ -297,9 +289,7 @@ Program::~Program() {
     for (ASTNode* decl : declarations) delete decl;
 }
 
-// =========================================================================
 // Métodos accept (Visitor Pattern)
-// =========================================================================
 Type BinaryExp::accept(Visitor* visitor)       { return visitor->visit(this); }
 Type UnaryExp::accept(Visitor* visitor)        { return visitor->visit(this); }
 Type AssignExp::accept(Visitor* visitor)       { return visitor->visit(this); }

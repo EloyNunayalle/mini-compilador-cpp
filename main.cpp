@@ -23,9 +23,7 @@ string sinExtension(const string& ruta) {
 }
 
 void mostrarAyuda(const char* prog) {
-    cout << "===============================================================\n";
-    cout << "  Mini-Compilador C++ (UTEC CS3402 - Proyecto 2: Avance 30%)   \n";
-    cout << "===============================================================\n";
+    cout << "Mini-Compilador C++\n\n";
     cout << "Uso: " << prog << " <archivo_fuente.cpp> [opciones]\n\n";
     cout << "Opciones:\n";
     cout << "  --scan    : Ejecuta solo el análisis léxico y muestra/guarda tokens.\n";

@@ -111,9 +111,7 @@ bool Parser::startsCtorCall() const {
     return peekTokenType() == Token::LPAREN;
 }
 
-// =========================================================================
 // Raíz y Directivas
-// =========================================================================
 
 Program* Parser::parseProgram() {
     int startLine = current ? current->line : 1;
@@ -208,9 +206,7 @@ vector<string> Parser::parseQualifiedId() {
     return parts;
 }
 
-// =========================================================================
 // Tipos
-// =========================================================================
 
 Type Parser::parseBaseType() {
     unsigned cbits = 0;
@@ -261,9 +257,7 @@ Type Parser::parseReturnType() {
     return t;
 }
 
-// =========================================================================
 // Declaraciones
-// =========================================================================
 
 ASTNode* Parser::parseDecl() {
     if (check(Token::KW_CLASS) || check(Token::KW_STRUCT)) {
@@ -586,9 +580,7 @@ vector<MemberInit> Parser::parseMemberInitList() {
     return list;
 }
 
-// =========================================================================
 // Bloques y Sentencias
-// =========================================================================
 
 BlockStmt* Parser::parseBlock() {
     int l = current->line;
@@ -760,9 +752,7 @@ ExprStmt* Parser::parseExprStmt() {
     return new ExprStmt(expr, l, c);
 }
 
-// =========================================================================
 // Expresiones con Jerarquía de Precedencia según EBNF
-// =========================================================================
 
 Exp* Parser::parseCExp() {
     return parseAssignExp();

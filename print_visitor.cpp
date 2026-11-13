@@ -33,9 +33,7 @@ void ASTPrinter::print(ASTNode* node) {
     node->accept(this);
 }
 
-// =========================================================================
 // Expresiones
-// =========================================================================
 
 Type ASTPrinter::visit(BinaryExp* exp) {
     printIndent();
@@ -184,9 +182,7 @@ Type ASTPrinter::visit(BracedInitList* exp) {
     return Type();
 }
 
-// =========================================================================
 // Sentencias
-// =========================================================================
 
 void ASTPrinter::visit(BlockStmt* stm) {
     printIndent();
@@ -301,9 +297,7 @@ void ASTPrinter::visit(ReturnStmt* stm) {
     }
 }
 
-// =========================================================================
 // Declaraciones y Directivas
-// =========================================================================
 
 void ASTPrinter::visit(VarInit* init) {
     printIndent();

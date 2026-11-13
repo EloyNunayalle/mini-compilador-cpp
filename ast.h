@@ -120,9 +120,7 @@ struct FieldInit {
     InitSpec spec;
 };
 
-// =========================================================================
 // Operadores Binarios y Unarios de C++
-// =========================================================================
 enum BinaryOp {
     PLUS_OP,        // +
     MINUS_OP,       // -
@@ -164,9 +162,7 @@ enum PostfixKind {
     CALL_ACCESS     // f(args)
 };
 
-// =========================================================================
 // Clase Base de Nodos AST (Sentencias, Declaraciones, Directivas, Programa)
-// =========================================================================
 class ASTNode {
 public:
     int line;
@@ -177,9 +173,7 @@ public:
     virtual ~ASTNode() = default;
 };
 
-// =========================================================================
-// Expresiones (Exp) - Producen un Type al visitarse (igual que en Sem11)
-// =========================================================================
+// Expresiones (Exp) - Producen un Type al visitarse
 class Exp {
 public:
     int line;
@@ -383,9 +377,7 @@ public:
     ~BracedInitList() override;
 };
 
-// =========================================================================
 // Sentencias (Stmt) - Ejecutan acciones y devuelven void al visitarse
-// =========================================================================
 class Stmt : public ASTNode {
 public:
     Stmt(int l = 1, int c = 1) : ASTNode(l, c) {}
@@ -520,9 +512,7 @@ public:
     ~ReturnStmt() override;
 };
 
-// =========================================================================
 // Declaraciones de Funciones, Clases y Directivas
-// =========================================================================
 
 // Parámetro formal de función: BaseType declarator
 class Param : public ASTNode {
@@ -618,9 +608,7 @@ public:
     ~UsingDirective() override;
 };
 
-// =========================================================================
 // Raíz del Programa: Program ::= [Includes] [Usings] Decl*
-// =========================================================================
 class Program : public ASTNode {
 public:
     vector<IncludeDirective*> includes;

@@ -182,4 +182,57 @@ t("suggestFor ofrece pistas segun el diagnostico", () => {
   assert.ok(typeof L.suggestFor({ message: XSS }) === "string");
 });
 
+t("astCategory clasifica por tipo de nodo", () => {
+  assert.strictEqual(L.astCategory("NumberExp"), "literal");
+  assert.strictEqual(L.astCategory("StringExp"), "literal");
+  assert.strictEqual(L.astCategory("IdExp"), "ident");
+  assert.strictEqual(L.astCategory("IfStmt"), "stmt");
+  assert.strictEqual(L.astCategory("BinaryExp"), "expr");
+  assert.strictEqual(L.astCategory("FunDecl"), "decl");
+});
+
+const SAMPLE = { kind: "Program", children: [
+  { kind: "FunDecl", label: "main", children: [{ kind: "BlockStmt", children: [
+    { kind: "ReturnStmt", children: [{ kind: "BinaryExp", label: "+", children: [{ kind: "NumberExp", label: "1" }, { kind: "IdExp", label: "x" }] }] },
+    { kind: "ExprStmt", children: [{ kind: "NumberExp", label: "2" }] }] }] },
+  { kind: "VarDecl", label: "g", type: "int", const: true, children: [] }, null ] };
+
+function overlaps(a, b) { return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h; }
+
+t("layoutTree: sin solapes y padres a la izquierda de sus hijos", () => {
+  const lay = L.layoutTree(SAMPLE, { typed: true });
+  assert.strictEqual(lay.visible, lay.nodes.length);
+  assert.strictEqual(lay.total, L.countNodes(SAMPLE));
+  for (let i = 0; i < lay.nodes.length; i++) for (let j = i + 1; j < lay.nodes.length; j++)
+    assert.ok(!overlaps(lay.nodes[i], lay.nodes[j]), "solape " + lay.nodes[i].id + " con " + lay.nodes[j].id);
+  lay.edges.forEach((e) => assert.ok(lay.byId[e.from].x + lay.byId[e.from].w < lay.byId[e.to].x));
+  lay.nodes.forEach((n) => { assert.ok(n.x >= 0 && n.y >= 0 && n.x + n.w <= lay.width && n.y + n.h <= lay.height); });
+});
+
+t("layoutTree: contraer oculta subarboles y cuenta los ocultos", () => {
+  const full = L.layoutTree(SAMPLE, {});
+  const col = L.layoutTree(SAMPLE, { collapsed: { "0.0": true } });
+  assert.ok(col.visible < full.visible);
+  assert.strictEqual(col.byId["0.0"].collapsed, true);
+  assert.strictEqual(col.byId["0.0"].hidden, L.countNodes(SAMPLE.children[0]) - 1);
+  assert.strictEqual(col.byId["0.0.0"], undefined);
+  assert.strictEqual(col.byId["0.1"].isConst, true);
+  const idx = L.layoutTree(SAMPLE, {}).nodes.map((n) => n.id);
+  assert.ok(idx.includes("0.1") && !idx.includes("0.2"), "los hijos nulos se omiten pero conservan el indice");
+});
+
+t("initialCollapsed y revealPath", () => {
+  const c = L.initialCollapsed(SAMPLE, 2);
+  assert.deepStrictEqual(Object.keys(c).sort(), ["0.0"]);
+  assert.strictEqual(L.layoutTree(SAMPLE, { collapsed: c }).visible, 3);
+  L.revealPath(c, "0.0.0.0");
+  assert.deepStrictEqual(c, {});
+  assert.deepStrictEqual(L.initialCollapsed(SAMPLE, 99), {});
+});
+
+t("layoutTree tolera nodos hostiles", () => {
+  const lay = L.layoutTree({ kind: XSS, label: XSS, type: XSS, children: [{ kind: XSS }, 5, "x"] }, { typed: true });
+  assert.ok(lay.nodes.every((n) => typeof n.kind === "string" && n.w >= 120 && n.w <= 270));
+});
+
 console.log(n + " pruebas correctas");

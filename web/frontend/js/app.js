@@ -896,21 +896,449 @@
     var total = L.countNodes(root);
     var ctl = createTree(root, typed);
     state.trees[key] = ctl;
+    var graph = null, allMode = "default";
+    var view = state.store.astView === "graph" ? "graph" : "list";
     var search = el("input", { attrs: { type: "search", "aria-label": "Buscar nodos en " + title, placeholder: "Buscar nodo, etiqueta, tipo…" } });
     var count = el("span", { cls: "count", text: total + " nodos" });
+    var seg = el("div", { cls: "seg seg-ast", attrs: { role: "radiogroup", "aria-label": "Vista del árbol" } }, [el("span", { cls: "seg-ind", attrs: { "aria-hidden": "true" } })]);
+    ["list", "graph"].forEach(function (v) {
+      var inp = el("input", { attrs: { type: "radio", name: "astview-" + key, value: v } });
+      if (v === view) inp.checked = true;
+      seg.appendChild(el("label", { cls: "seg-opt" }, [inp, el("span", { text: v === "list" ? "Lista" : "Gráfico" })]));
+    });
     var tools = el("div", { cls: "tools" }, [
-      search, button("Expandir todo", function () { ctl.expandAll(); }), button("Contraer todo", function () { ctl.collapseAll(); }), count
+      seg, search, button("Expandir todo", function () { allMode = "expanded"; ctl.expandAll(); if (graph) graph.expandAll(); }),
+      button("Contraer todo", function () { allMode = "collapsed"; ctl.collapseAll(); if (graph) graph.collapseAll(); }), count
+    ]);
+    var svgTools = el("span", { cls: "ag-export" }, [
+      button("Descargar SVG", function () { if (graph) graph.downloadSvg(); }, "", "download"),
+      button("Descargar PNG", function () { if (graph) graph.downloadPng(); }, "", "download")
     ]);
     if (key === "ast" || key === "typed") {
       tools.appendChild(button("Copiar JSON", function () { copyText(JSON.stringify(root, null, 2), "JSON"); }, "", "copy"));
       tools.appendChild(button("Descargar JSON", function () { download(key + ".json", JSON.stringify(root, null, 2), "application/json"); }, "", "download"));
     }
+    tools.appendChild(svgTools);
+    var graphHost = el("div", { cls: "ag-host" });
+    function showView(v) {
+      ctl.element.hidden = v === "graph";
+      graphHost.hidden = v !== "graph";
+      svgTools.hidden = v !== "graph";
+      if (v === "graph") {
+        if (!graph) {
+          graph = createGraph(root, typed, allMode);
+          graphHost.appendChild(graph.element);
+          if (search.value.trim()) graph.search(search.value);
+        }
+        graph.fit();
+      }
+    }
+    seg.addEventListener("change", function (ev) {
+      var v = ev.target.value;
+      if (v !== "list" && v !== "graph") return;
+      saveStore({ astView: v }, true);
+      placeSeg(seg);
+      showView(v);
+    });
     search.addEventListener("input", function () {
       var n = ctl.search(search.value);
+      if (graph) graph.search(search.value);
       count.textContent = search.value.trim() ? n + " coincidencias de " + total + " nodos" : total + " nodos";
+    });
+    search.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" && graph && !graphHost.hidden) { ev.preventDefault(); graph.next(); }
     });
     p.appendChild(tools);
     p.appendChild(ctl.element);
+    p.appendChild(graphHost);
+    placeSeg(seg);
+    requestAnimationFrame(function () { seg.classList.add("ready"); });
+    showView(view);
+  }
+
+  function createGraph(root, typed, initial) {
+    var collapsed = initial === "expanded" ? {} : L.initialCollapsed(root, initial === "collapsed" ? 2 : (L.countNodes(root) <= 60 ? 99 : 4));
+    var view = { k: 1, tx: 24, ty: 24 };
+    var lay = null, selected = null, focusId = "0", hits = {}, hitList = [], hitIdx = -1, touched = false, prevIds = null;
+    var host = el("div", { cls: "agraph" });
+    var svg = svgEl("svg", { role: "tree", "aria-label": typed ? "Grafico del AST con tipos" : "Grafico del AST" });
+    var world = svgEl("g", { "class": "ag-world" });
+    var gEdges = svgEl("g", {}), gNodes = svgEl("g", {});
+    world.appendChild(gEdges);
+    world.appendChild(gNodes);
+    svg.appendChild(world);
+    var viewEl = el("div", { cls: "ag-view" }, [svg]);
+    var info = el("div", { cls: "ag-info", attrs: { hidden: "" } });
+    var mini = svgEl("svg", { "class": "ag-mini", "aria-hidden": "true", viewBox: "0 0 160 100" });
+    var miniDots = svgEl("g", {}), miniVp = svgEl("rect", { "class": "ag-vp", rx: 2 });
+    mini.appendChild(miniDots);
+    mini.appendChild(miniVp);
+    var counter = el("span", { cls: "ag-count", attrs: { "aria-live": "polite" } });
+
+    function size() { return { w: viewEl.clientWidth, h: viewEl.clientHeight }; }
+
+    function applyView(animate) {
+      world.classList.toggle("anim", !!animate && !prefersReduced());
+      world.style.transform = "translate(" + view.tx.toFixed(1) + "px," + view.ty.toFixed(1) + "px) scale(" + view.k.toFixed(4) + ")";
+      updateMini();
+    }
+
+    function updateMini() {
+      var sz = size();
+      if (!lay || !sz.w) { miniVp.setAttribute("width", "0"); return; }
+      var sc = Math.min(150 / Math.max(lay.width, 1), 90 / Math.max(lay.height, 1));
+      var vx = -view.tx / view.k, vy = -view.ty / view.k;
+      miniVp.setAttribute("x", (5 + vx * sc).toFixed(1));
+      miniVp.setAttribute("y", (5 + vy * sc).toFixed(1));
+      miniVp.setAttribute("width", Math.max(4, sz.w / view.k * sc).toFixed(1));
+      miniVp.setAttribute("height", Math.max(4, sz.h / view.k * sc).toFixed(1));
+    }
+
+    function fit(animate) {
+      var sz = size();
+      if (!lay || !sz.w || !sz.h) return;
+      var pad = 40;
+      var k = Math.min((sz.w - pad) / Math.max(lay.width, 1), (sz.h - pad) / Math.max(lay.height, 1), 1.1);
+      /* Con arboles grandes se prefiere legibilidad: no bajar de 0.65 y centrar en la raiz. */
+      view.k = Math.max(0.65, k);
+      view.tx = Math.max(20, (sz.w - lay.width * view.k) / 2);
+      var root0 = lay.byId["0"];
+      var cy = root0.y + root0.h / 2;
+      view.ty = lay.height * view.k + 32 <= sz.h ? (sz.h - lay.height * view.k) / 2 : sz.h / 2 - cy * view.k;
+      touched = false;
+      applyView(animate);
+    }
+
+    function zoomAt(f, cx, cy, animate) {
+      var sz = size();
+      if (cx == null) { cx = sz.w / 2; cy = sz.h / 2; }
+      var nk = Math.min(2.5, Math.max(0.12, view.k * f));
+      var r = nk / view.k;
+      view.tx = cx - (cx - view.tx) * r;
+      view.ty = cy - (cy - view.ty) * r;
+      view.k = nk;
+      touched = true;
+      applyView(animate);
+    }
+
+    function centerOn(id, animate) {
+      var n = lay && lay.byId[id], sz = size();
+      if (!n || !sz.w) return;
+      view.tx = sz.w / 2 - (n.x + n.w / 2) * view.k;
+      view.ty = sz.h / 2 - (n.y + n.h / 2) * view.k;
+      touched = true;
+      applyView(animate);
+    }
+
+    function ensureVisible(id) {
+      var n = lay && lay.byId[id], sz = size();
+      if (!n || !sz.w) return;
+      var l = n.x * view.k + view.tx, t = n.y * view.k + view.ty, r = l + n.w * view.k, b = t + n.h * view.k;
+      if (l < 8 || t < 8 || r > sz.w - 8 || b > sz.h - 8) centerOn(id, true);
+    }
+
+    function nodeEl(n) {
+      var cls = "ag-node cat-" + n.cat + (selected === n.id ? " sel" : "") + (hits[n.id] ? " hit" : "") + (prevIds && !prevIds[n.id] ? " new" : "");
+      var attrs = { "class": cls, role: "treeitem", "data-id": n.id, "aria-level": String(n.depth + 1),
+        tabindex: focusId === n.id ? "0" : "-1", transform: "translate(" + Math.round(n.x) + " " + Math.round(n.y) + ")",
+        "aria-label": n.kind + (n.label ? " " + n.label : "") + (n.line != null ? ", línea " + n.line : "") };
+      if (n.childCount) attrs["aria-expanded"] = n.collapsed ? "false" : "true";
+      var g = svgEl("g", attrs);
+      var tip = svgEl("title", {});
+      tip.textContent = n.kind + (n.label ? ": " + n.label : "") + (n.type ? " : " + n.type : "") + (n.line != null ? "  (" + n.line + (n.col != null ? ":" + n.col : "") + ")" : "");
+      g.appendChild(tip);
+      g.appendChild(svgEl("rect", { "class": "card", width: n.w, height: n.h, rx: 11 }));
+      g.appendChild(svgEl("rect", { "class": "strip", x: 0, y: 10, width: 4, height: n.h - 20, rx: 2 }));
+      var t1 = svgEl("text", { "class": "ag-kind", x: 14, y: 20 });
+      t1.textContent = n.kind;
+      g.appendChild(t1);
+      if (n.shown) {
+        var t2 = svgEl("text", { "class": "ag-label", x: 14, y: 38 });
+        t2.textContent = n.shown;
+        g.appendChild(t2);
+      }
+      if (n.chips) {
+        var cx = 14;
+        if (n.type) {
+          var tt = n.type.length > 22 ? n.type.slice(0, 21) + "…" : n.type;
+          var cw = tt.length * 6.6 + 14;
+          g.appendChild(svgEl("rect", { "class": "ag-chip", x: cx, y: 44, width: cw, height: 16, rx: 8 }));
+          var tc = svgEl("text", { "class": "ag-chip-t", x: cx + 7, y: 56 });
+          tc.textContent = tt;
+          g.appendChild(tc);
+          cx += cw + 6;
+        }
+        if (n.isConst) {
+          g.appendChild(svgEl("rect", { "class": "ag-chip const", x: cx, y: 44, width: 40, height: 16, rx: 8 }));
+          var tk = svgEl("text", { "class": "ag-chip-t const", x: cx + 7, y: 56 });
+          tk.textContent = "const";
+          g.appendChild(tk);
+        }
+      }
+      if (n.collapsed) {
+        g.appendChild(svgEl("circle", { "class": "ag-badge", cx: n.w, cy: n.h / 2, r: 12 }));
+        var tb = svgEl("text", { "class": "ag-badge-t", x: n.w, y: n.h / 2 + 4 });
+        tb.textContent = "+" + (n.hidden > 99 ? "99" : n.hidden);
+        g.appendChild(tb);
+      }
+      return g;
+    }
+
+    function render(animateNew) {
+      lay = L.layoutTree(root, { collapsed: collapsed, typed: typed });
+      clear(gEdges); clear(gNodes); clear(miniDots);
+      lay.edges.forEach(function (e) {
+        var a = lay.byId[e.from], b = lay.byId[e.to];
+        var x1 = a.x + a.w, y1 = a.y + a.h / 2, x2 = b.x, y2 = b.y + b.h / 2, dx = (x2 - x1) * 0.55;
+        gEdges.appendChild(svgEl("path", { "class": "ag-edge" + (selected && (e.to === selected || e.from === selected) ? " hot" : ""), d: "M" + x1 + " " + y1 + " C" + (x1 + dx) + " " + y1 + " " + (x2 - dx) + " " + y2 + " " + x2 + " " + y2 }));
+      });
+      var frag = document.createDocumentFragment();
+      lay.nodes.forEach(function (n) { frag.appendChild(nodeEl(n)); });
+      gNodes.appendChild(frag);
+      var sc = Math.min(150 / Math.max(lay.width, 1), 90 / Math.max(lay.height, 1));
+      lay.nodes.forEach(function (n) {
+        miniDots.appendChild(svgEl("rect", { x: (5 + n.x * sc).toFixed(1), y: (5 + n.y * sc).toFixed(1), width: Math.max(1.5, n.w * sc).toFixed(1), height: Math.max(1.2, n.h * sc).toFixed(1) }));
+      });
+      counter.textContent = lay.visible + " de " + lay.total + " nodos visibles";
+      prevIds = {};
+      lay.nodes.forEach(function (n) { prevIds[n.id] = true; });
+      updateMini();
+    }
+
+    function showInfo(n) {
+      clear(info);
+      if (!n) { info.hidden = true; return; }
+      info.hidden = false;
+      info.appendChild(el("strong", { text: n.kind }));
+      if (n.label) info.appendChild(el("span", { cls: "mono", text: n.label }));
+      var rows = [];
+      if (n.line != null) rows.push(["Posición", n.line + (n.col != null ? ":" + n.col : "")]);
+      if (n.type) rows.push(["Tipo", n.type]);
+      if (n.isConst) rows.push(["const", "sí"]);
+      Object.keys(n.attrs || {}).forEach(function (k) {
+        var v = n.attrs[k];
+        if (v !== null && typeof v !== "object" && (typed || k === "offset" || k === "size")) rows.push([k, String(v)]);
+      });
+      var dl = el("dl");
+      rows.slice(0, 10).forEach(function (r) { dl.appendChild(el("div", {}, [el("dt", { text: r[0] }), el("dd", { text: r[1] })])); });
+      info.appendChild(dl);
+    }
+
+    function toggle(id) {
+      var n = lay.byId[id];
+      if (!n || !n.childCount) return;
+      var old = { x: n.x * view.k + view.tx, y: n.y * view.k + view.ty };
+      if (collapsed[id]) delete collapsed[id]; else collapsed[id] = true;
+      focusId = id;
+      render(true);
+      var nn = lay.byId[id];
+      view.tx = old.x - nn.x * view.k;
+      view.ty = old.y - nn.y * view.k;
+      applyView(false);
+      refocus();
+    }
+
+    function refocus() {
+      var node = gNodes.querySelector('[data-id="' + focusId + '"]');
+      if (node && node.focus) node.focus({ preventScroll: true });
+    }
+
+    function select(id, goto) {
+      var n = lay.byId[id];
+      if (!n) return;
+      selected = id;
+      focusId = id;
+      showInfo(n);
+      if (goto && n.line != null) goTo(n.line, n.col, false);
+    }
+
+    function activate(id) {
+      select(id, true);
+      var n = lay.byId[id];
+      if (n && n.childCount) toggle(id); else { render(false); refocus(); }
+    }
+
+    /* Raton y tactil: arrastrar para mover, pellizcar para ampliar, clic corto para activar. */
+    var ptrs = {}, down = null, pinch = null;
+    svg.addEventListener("pointerdown", function (ev) {
+      ptrs[ev.pointerId] = { x: ev.clientX, y: ev.clientY };
+      var ids = Object.keys(ptrs);
+      if (ids.length === 2) {
+        var a = ptrs[ids[0]], b = ptrs[ids[1]];
+        pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), k: view.k };
+        down = null;
+      } else {
+        var t = ev.target.closest ? ev.target.closest(".ag-node") : null;
+        down = { x: ev.clientX, y: ev.clientY, tx: view.tx, ty: view.ty, node: t, moved: false };
+      }
+    });
+    svg.addEventListener("pointermove", function (ev) {
+      if (!ptrs[ev.pointerId]) return;
+      ptrs[ev.pointerId] = { x: ev.clientX, y: ev.clientY };
+      var ids = Object.keys(ptrs);
+      if (ids.length === 2 && pinch) {
+        var a = ptrs[ids[0]], b = ptrs[ids[1]], r = viewEl.getBoundingClientRect();
+        var d = Math.hypot(a.x - b.x, a.y - b.y);
+        zoomAt((pinch.k * d / pinch.d) / view.k, (a.x + b.x) / 2 - r.left, (a.y + b.y) / 2 - r.top, false);
+      } else if (down) {
+        var dx = ev.clientX - down.x, dy = ev.clientY - down.y;
+        if (!down.moved && Math.hypot(dx, dy) > 5) { down.moved = true; viewEl.classList.add("panning"); try { svg.setPointerCapture(ev.pointerId); } catch (e) { /* sin captura */ } }
+        if (down.moved) { view.tx = down.tx + dx; view.ty = down.ty + dy; touched = true; applyView(false); }
+      }
+    });
+    function up(ev) {
+      var d = down;
+      delete ptrs[ev.pointerId];
+      if (Object.keys(ptrs).length < 2) pinch = null;
+      viewEl.classList.remove("panning");
+      if (d && !d.moved && d.node && ev.type === "pointerup") activate(d.node.getAttribute("data-id"));
+      down = null;
+    }
+    svg.addEventListener("pointerup", up);
+    svg.addEventListener("pointercancel", up);
+    svg.addEventListener("wheel", function (ev) {
+      ev.preventDefault();
+      var r = viewEl.getBoundingClientRect();
+      var f = Math.exp(-ev.deltaY * (ev.ctrlKey ? 0.012 : 0.0016));
+      zoomAt(f, ev.clientX - r.left, ev.clientY - r.top, false);
+    }, { passive: false });
+    mini.addEventListener("pointerdown", function (ev) {
+      var r = mini.getBoundingClientRect(), sc = Math.min(150 / Math.max(lay.width, 1), 90 / Math.max(lay.height, 1)), sz = size();
+      var wx = ((ev.clientX - r.left) / r.width * 160 - 5) / sc, wy = ((ev.clientY - r.top) / r.height * 100 - 5) / sc;
+      view.tx = sz.w / 2 - wx * view.k;
+      view.ty = sz.h / 2 - wy * view.k;
+      touched = true;
+      applyView(true);
+    });
+
+    /* Teclado: flechas entre padre, hijos y hermanos; Enter alterna. */
+    svg.addEventListener("keydown", function (ev) {
+      var t = ev.target.closest ? ev.target.closest(".ag-node") : null;
+      if (!t) return;
+      var id = t.getAttribute("data-id"), n = lay.byId[id], to = null;
+      var kids = lay.nodes.filter(function (m) { return m.parent === id; });
+      var sibs = lay.nodes.filter(function (m) { return m.parent === n.parent; });
+      var col = lay.nodes.filter(function (m) { return m.depth === n.depth; });
+      if (ev.key === "ArrowRight") { if (n.collapsed) { ev.preventDefault(); toggle(id); return; } if (kids.length) to = kids[0].id; }
+      else if (ev.key === "ArrowLeft") { if (n.parent) to = n.parent; }
+      else if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+        var list = n.parent ? sibs : col, i = list.indexOf(n) + (ev.key === "ArrowDown" ? 1 : -1);
+        if (i < 0 || i >= list.length) list = col, i = list.indexOf(n) + (ev.key === "ArrowDown" ? 1 : -1);
+        if (list[i]) to = list[i].id;
+      }
+      else if (ev.key === "Home") to = "0";
+      else if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); activate(id); return; }
+      else return;
+      ev.preventDefault();
+      if (to) {
+        focusId = to;
+        Array.prototype.forEach.call(gNodes.children, function (g) { g.setAttribute("tabindex", g.getAttribute("data-id") === to ? "0" : "-1"); });
+        refocus();
+        select(to, false);
+        Array.prototype.forEach.call(gNodes.children, function (g) { g.classList.toggle("sel", g.getAttribute("data-id") === to); });
+        ensureVisible(to);
+      }
+    });
+    svg.addEventListener("focusin", function (ev) {
+      var t = ev.target.closest ? ev.target.closest(".ag-node") : null;
+      if (t) { focusId = t.getAttribute("data-id"); }
+    });
+
+    function btn(label, aria, fn) {
+      return el("button", { cls: "ag-btn", text: label, attrs: { type: "button", "aria-label": aria, title: aria }, on: { click: fn } });
+    }
+    var bar = el("div", { cls: "ag-bar", attrs: { role: "toolbar", "aria-label": "Controles del gráfico" } }, [
+      btn("−", "Reducir zoom", function () { zoomAt(1 / 1.25, null, null, true); }),
+      btn("+", "Aumentar zoom", function () { zoomAt(1.25, null, null, true); }),
+      btn("Ajustar", "Ajustar a la pantalla", function () { fit(true); }),
+      btn("1:1", "Restablecer zoom y posición", function () {
+        view.k = 1; view.tx = 24; view.ty = Math.max(16, size().h / 2 - (lay.byId["0"].y + lay.byId["0"].h / 2));
+        touched = true; applyView(true);
+      })
+    ]);
+    var hint = el("div", { cls: "ag-hint", text: "Rueda: zoom · Arrastrar: mover · Clic: contraer o expandir · Flechas: navegar" });
+    host.appendChild(viewEl);
+    host.appendChild(bar);
+    host.appendChild(counter);
+    host.appendChild(info);
+    host.appendChild(mini);
+    host.appendChild(hint);
+
+    if (window.ResizeObserver) new ResizeObserver(function () { if (!touched) fit(false); else updateMini(); }).observe(viewEl);
+
+    function exportSvg() {
+      var cs = getComputedStyle(document.documentElement);
+      function v(name, fb) { return (cs.getPropertyValue(name) || fb).trim() || fb; }
+      var cat = { decl: v("--cm-def", "#2a49c9"), stmt: v("--cm-type", "#0a6d8f"), expr: v("--cm-keyword", "#7c3aed"), literal: v("--cm-number", "#15803d"), ident: v("--cm-meta", "#92580a") };
+      var css = ".card{fill:" + v("--surface", "#fff") + ";stroke:" + v("--line-strong", "#c3cbe6") + ";stroke-width:1.2}" +
+        ".ag-kind{font:700 12px system-ui,sans-serif;fill:" + v("--ink", "#121832") + "}.ag-label{font:500 11.5px ui-monospace,Menlo,monospace;fill:" + v("--ink-2", "#444e72") + "}" +
+        ".ag-chip{fill:" + v("--info-soft", "#e0f1fb") + "}.ag-chip-t{font:600 10px ui-monospace,Menlo,monospace;fill:" + v("--info", "#0b6fa8") + "}" +
+        ".ag-badge{fill:" + v("--accent-fill", "#3b5bdb") + "}.ag-badge-t{font:700 10px system-ui,sans-serif;fill:#fff;text-anchor:middle}" +
+        ".ag-edge{fill:none;stroke:" + v("--line-strong", "#c3cbe6") + ";stroke-width:1.5}";
+      Object.keys(cat).forEach(function (k) { css += ".cat-" + k + " .strip{fill:" + cat[k] + "}"; });
+      var pad = 20, W = Math.ceil(lay.width + pad * 2), H = Math.ceil(lay.height + pad * 2);
+      var out = svgEl("svg", { viewBox: "0 0 " + W + " " + H, width: W, height: H });
+      var st = svgEl("style", {});
+      st.textContent = css;
+      out.appendChild(st);
+      out.appendChild(svgEl("rect", { width: W, height: H, fill: v("--surface-2", "#f6f8fe") }));
+      var g = svgEl("g", { transform: "translate(" + pad + " " + pad + ")" });
+      g.appendChild(gEdges.cloneNode(true));
+      var nodesCopy = gNodes.cloneNode(true);
+      Array.prototype.forEach.call(nodesCopy.querySelectorAll("title"), function (t) { t.parentNode.removeChild(t); });
+      g.appendChild(nodesCopy);
+      out.appendChild(g);
+      return { text: '<?xml version="1.0" encoding="UTF-8"?>\n' + new XMLSerializer().serializeToString(out), w: W, h: H };
+    }
+
+    function exportPng(name) {
+      var e = exportSvg(), img = new Image();
+      img.onload = function () {
+        var c = document.createElement("canvas"), sc = 2;
+        c.width = e.w * sc; c.height = e.h * sc;
+        var ctx = c.getContext("2d");
+        ctx.scale(sc, sc);
+        ctx.drawImage(img, 0, 0);
+        c.toBlob(function (blob) {
+          if (!blob) { toast("No se pudo generar el PNG", "err"); return; }
+          var url = URL.createObjectURL(blob), a = el("a", { attrs: { href: url, download: name } });
+          document.body.appendChild(a); a.click(); document.body.removeChild(a);
+          setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+          toast("Descargando " + name);
+        }, "image/png");
+      };
+      img.onerror = function () { toast("No se pudo generar el PNG", "err"); };
+      img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(e.text);
+    }
+
+    render(false);
+    applyView(false);
+
+    return {
+      element: host,
+      fit: function () { fit(false); },
+      expandAll: function () { collapsed = {}; render(false); fit(false); },
+      collapseAll: function () { collapsed = L.initialCollapsed(root, 2); render(false); fit(false); },
+      search: function (q) {
+        var res = L.searchTree(root, q);
+        hits = res.matches;
+        hitList = Object.keys(hits).sort();
+        hitIdx = -1;
+        if (String(q || "").trim()) Object.keys(res.expand).forEach(function (p) { delete collapsed[p]; });
+        render(false);
+        if (hitList.length) { hitIdx = 0; focusId = hitList[0]; centerOn(hitList[0], true); }
+        return res.count;
+      },
+      next: function () {
+        if (!hitList.length) return;
+        hitIdx = (hitIdx + 1) % hitList.length;
+        L.revealPath(collapsed, hitList[hitIdx]);
+        render(false);
+        centerOn(hitList[hitIdx], true);
+      },
+      downloadSvg: function () { download("ast-grafico.svg", exportSvg().text, "image/svg+xml"); },
+      downloadPng: function () { exportPng("ast-grafico.png"); }
+    };
   }
 
   function createTree(root, typed) {

@@ -85,6 +85,25 @@ const XSS = "<img src=x onerror=window.__pwned=1>";
   d.getElementById("btn-examples").click();
   assert.ok(d.querySelectorAll("#ex-grid .ex-card").length > 5, "tarjetas de ejemplos");
   assert.ok(d.querySelector("#ex-grid .tag"), "etiquetas en tarjetas");
+  // conmutador Lista | Grafico del AST
+  d.querySelector("#tab-ast").click();
+  assert.ok(d.querySelector("#panel-ast .seg-ast"), "conmutador de vista");
+  assert.strictEqual(d.querySelector("#panel-ast .ag-host").hidden, true, "lista por defecto");
+  const gradio = d.querySelector("#panel-ast input[name=astview-ast][value=graph]");
+  gradio.checked = true;
+  gradio.dispatchEvent(new w.Event("change", { bubbles: true }));
+  assert.strictEqual(d.querySelector("#panel-ast .ag-host").hidden, false);
+  assert.strictEqual(d.querySelector("#panel-ast .tree").parentNode.hidden, true);
+  assert.ok(d.querySelectorAll("#panel-ast .agraph [role=treeitem]").length >= 2, "nodos del grafico");
+  assert.ok(d.querySelector("#panel-ast .agraph").textContent.includes(XSS), "texto literal en el grafico");
+  assert.strictEqual(d.querySelectorAll("#panel-ast .agraph img").length, 0);
+  assert.ok(JSON.parse(w.localStorage.getItem("mcpp.v1")).astView === "graph", "vista recordada");
+  const first = d.querySelector("#panel-ast .agraph [role=treeitem]");
+  first.dispatchEvent(new w.KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+  const srch = d.querySelector("#panel-ast input[type=search]");
+  srch.value = "Hijo";
+  srch.dispatchEvent(new w.Event("input", { bubbles: true }));
+  assert.ok(d.querySelectorAll("#panel-ast .agraph .ag-node.hit").length >= 1, "coincidencias resaltadas en el grafico");
   // el texto del compilador nunca crea nodos HTML
   assert.strictEqual(d.querySelectorAll("#panel-diag img, #panel-layout img, #panel-opt img, #bubble img, #toast img").length, 0);
   assert.ok(["error", "enojada", "asustada"].includes(w.MCMascot.state()), "mascota reacciona al error: " + w.MCMascot.state());

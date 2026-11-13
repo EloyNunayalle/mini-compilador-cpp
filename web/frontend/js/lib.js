@@ -238,6 +238,101 @@
     };
   }
 
+  /* Categoria visual de un nodo del AST segun su kind. */
+  function astCategory(kind) {
+    var k = String(kind || "");
+    if (/^(Number|Bool|Char|Real|String|Null)Exp$/.test(k) || /Literal$/.test(k)) return "literal";
+    if (/^IdExp$|Ident$|^Name$/.test(k)) return "ident";
+    if (/Stmt$/.test(k)) return "stmt";
+    if (/Exp$|Expr$/.test(k)) return "expr";
+    return "decl";
+  }
+
+  /* Rutas a contraer al inicio: los nodos con hijos a profundidad maxDepth-1 o mas. */
+  function initialCollapsed(root, maxDepth) {
+    var out = {};
+    function walk(raw, path, depth) {
+      var n = normalizeNode(raw);
+      if (!n || !n.children.length) return;
+      if (depth >= maxDepth - 1) { out[path] = true; return; }
+      n.children.forEach(function (c, i) { walk(c, path + "." + i, depth + 1); });
+    }
+    walk(root, "0", 0);
+    return out;
+  }
+
+  /* Quita la marca de contraido en todos los ancestros de path (para revelar un nodo). */
+  function revealPath(collapsed, path) {
+    var parts = String(path).split(".");
+    for (var i = 1; i < parts.length; i++) delete collapsed[parts.slice(0, i).join(".")];
+    return collapsed;
+  }
+
+  function trunc(s, n) { s = String(s); return s.length > n ? s.slice(0, n - 1) + "\u2026" : s; }
+
+  /* Diseno horizontal del arbol visible: columnas por profundidad y hojas en filas consecutivas.
+   * Cada padre se centra sobre sus hijos, asi que no hay solapes. Devuelve nodos, aristas y tamano. */
+  function layoutTree(root, opts) {
+    opts = opts || {};
+    var collapsed = opts.collapsed || {};
+    var typed = !!opts.typed;
+    var gapX = opts.gapX == null ? 46 : opts.gapX, gapY = opts.gapY == null ? 14 : opts.gapY;
+    var nodes = [], edges = [], cols = [], next = 0, byId = {};
+
+    function descendants(raw) {
+      var n = normalizeNode(raw);
+      return n ? countNodes(n) - 1 : 0;
+    }
+
+    function visit(raw, path, depth, parent) {
+      var n = normalizeNode(raw);
+      if (!n) return null;
+      var hasKids = n.children.length > 0;
+      var isCol = hasKids && !!collapsed[path];
+      var label = trunc(n.label, 30);
+      var chips = typed && (n.type || n.isConst);
+      var w = Math.max(n.kind.length * 7.6 + 30, label.length * 6.9 + 30, chips ? trunc(n.type, 22).length * 6.6 + (n.isConst ? 52 : 28) : 0, 120);
+      w = Math.min(Math.round(w), 270);
+      var h = chips ? 64 : 48;
+      var info = {
+        id: path, parent: parent, depth: depth, kind: n.kind, label: n.label, shown: label, type: n.type, isConst: n.isConst,
+        line: n.line, col: n.col, attrs: n.attrs, cat: astCategory(n.kind), childCount: n.children.length,
+        collapsed: isCol, hidden: isCol ? descendants(raw) : 0, w: w, h: h, x: 0, y: 0, chips: !!chips
+      };
+      nodes.push(info);
+      byId[path] = info;
+      cols[depth] = Math.max(cols[depth] || 0, w);
+      var kids = [];
+      if (hasKids && !isCol) {
+        n.children.forEach(function (c, i) {
+          var ch = visit(c, path + "." + i, depth + 1, path);
+          if (ch) { kids.push(ch); edges.push({ from: path, to: ch.id }); }
+        });
+      }
+      if (kids.length) {
+        var a = kids[0], b = kids[kids.length - 1];
+        info.y = (a.y + a.h / 2 + b.y + b.h / 2) / 2 - h / 2;
+      } else {
+        info.y = next;
+        next += h + gapY;
+      }
+      return info;
+    }
+
+    visit(root, "0", 0, null);
+    var xs = [], acc = 0;
+    cols.forEach(function (w, d) { xs[d] = acc; acc += w + gapX; });
+    var width = 0, height = 0, minY = 0;
+    nodes.forEach(function (n) { if (n.y < minY) minY = n.y; });
+    nodes.forEach(function (n) {
+      n.x = xs[n.depth];
+      n.y -= minY;
+      width = Math.max(width, n.x + n.w);
+      height = Math.max(height, n.y + n.h);
+    });
+    return { nodes: nodes, edges: edges, byId: byId, width: width, height: height, visible: nodes.length, total: root ? countNodes(root) : 0 };
+  }
+
   function isNum(v) { return typeof v === "number" && isFinite(v); }
 
   /* Busca nodos cuyo texto contenga q; devuelve rutas coincidentes y rutas a expandir. */
@@ -464,7 +559,7 @@
   }
 
   return {
-    PHASES: PHASES, suggestFor: suggestFor, sideBySide: sideBySide, mascotReaction: mascotReaction, escapeHtml: escapeHtml, phaseLabel: phaseLabel, formatCode: formatCode,
+    PHASES: PHASES, astCategory: astCategory, initialCollapsed: initialCollapsed, revealPath: revealPath, layoutTree: layoutTree, suggestFor: suggestFor, sideBySide: sideBySide, mascotReaction: mascotReaction, escapeHtml: escapeHtml, phaseLabel: phaseLabel, formatCode: formatCode,
     tokenizeAsmLine: tokenizeAsmLine, extractStrings: extractStrings, diffLines: diffLines,
     summarizeDiff: summarizeDiff, normalizeNode: normalizeNode, searchTree: searchTree,
     countNodes: countNodes, attrChips: attrChips, filterTokens: filterTokens,
